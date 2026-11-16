@@ -1,7 +1,6 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import swagger from '@fastify/swagger';
-import swaggerUi from '@fastify/swagger-ui';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -47,13 +46,21 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   });
 
-  await app.register(swaggerUi, {
-    routePrefix: '/docs',
-    uiConfig: {
-      docExpansion: 'list',
-      deepLinking: false,
-    },
-  });
+  // Swagger UI for interactive docs when running standalone
+  if (!process.env.VERCEL) {
+    try {
+      const { default: swaggerUi } = await import('@fastify/swagger-ui');
+      await app.register(swaggerUi, {
+        routePrefix: '/docs',
+        uiConfig: {
+          docExpansion: 'list',
+          deepLinking: false,
+        },
+      });
+    } catch (e) {
+      console.warn('Notice loading swagger-ui:', e);
+    }
+  }
 
   // Register API routes
   await app.register(
