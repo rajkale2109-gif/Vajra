@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "outputDirectory": "public",
   "rewrites": [
     {
       "source": "/api/(.*)",
@@ -12,10 +13,6 @@
     {
       "source": "/docs",
       "destination": "/api/index.ts"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/src/client/$1"
     }
   ]
 }

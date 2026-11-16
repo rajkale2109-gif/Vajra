@@ -1,9 +1,9 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
-import fastifyStatic from '@fastify/static';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { overviewRoutes } from './routes/overview.js';
 import { campaignsRoutes } from './routes/campaigns.js';
@@ -64,12 +64,26 @@ export async function buildApp(): Promise<FastifyInstance> {
     { prefix: '/api' }
   );
 
-  // Serve Frontend static assets from client/
-  const clientPath = path.resolve(__dirname, '../client');
-  await app.register(fastifyStatic, {
-    root: clientPath,
-    prefix: '/',
-  });
+  // Serve Frontend static assets when running standalone (Vercel CDN serves static assets directly)
+  if (!process.env.VERCEL) {
+    try {
+      const { default: fastifyStatic } = await import('@fastify/static');
+      let clientPath = path.resolve(process.cwd(), 'public');
+      if (!fs.existsSync(clientPath)) {
+        const fallbackClient = path.resolve(__dirname, '../client');
+        const cwdClient = path.resolve(process.cwd(), 'src/client');
+        clientPath = fs.existsSync(cwdClient) ? cwdClient : fallbackClient;
+      }
+      if (fs.existsSync(clientPath)) {
+        await app.register(fastifyStatic, {
+          root: clientPath,
+          prefix: '/',
+        });
+      }
+    } catch (e) {
+      console.warn('Notice loading static file server:', e);
+    }
+  }
 
   return app;
 }
