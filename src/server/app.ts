@@ -66,23 +66,41 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   // Serve Frontend static assets when running standalone (Vercel CDN serves static assets directly)
   if (!process.env.VERCEL) {
-    try {
-      const { default: fastifyStatic } = await import('@fastify/static');
-      let clientPath = path.resolve(process.cwd(), 'public');
-      if (!fs.existsSync(clientPath)) {
-        const fallbackClient = path.resolve(__dirname, '../client');
-        const cwdClient = path.resolve(process.cwd(), 'src/client');
-        clientPath = fs.existsSync(cwdClient) ? cwdClient : fallbackClient;
-      }
-      if (fs.existsSync(clientPath)) {
-        await app.register(fastifyStatic, {
-          root: clientPath,
-          prefix: '/',
-        });
-      }
-    } catch (e) {
-      console.warn('Notice loading static file server:', e);
+    let clientPath = path.resolve(process.cwd(), 'public');
+    if (!fs.existsSync(clientPath)) {
+      const fallbackClient = path.resolve(__dirname, '../client');
+      const cwdClient = path.resolve(process.cwd(), 'src/client');
+      clientPath = fs.existsSync(cwdClient) ? cwdClient : fallbackClient;
     }
+
+    const mimeTypes: Record<string, string> = {
+      '.html': 'text/html; charset=utf-8',
+      '.js': 'application/javascript; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.json': 'application/json; charset=utf-8',
+      '.svg': 'image/svg+xml',
+      '.png': 'image/png',
+      '.ico': 'image/x-icon',
+    };
+
+    app.get('/*', async (request, reply) => {
+      let reqPath = (request.params as any)['*'] || '';
+      if (!reqPath || reqPath === '') reqPath = 'index.html';
+      const safePath = path.normalize(reqPath).replace(/^(\.\.[\/\\])+/, '');
+      let filePath = path.join(clientPath, safePath);
+
+      if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+        filePath = path.join(clientPath, 'index.html');
+      }
+
+      if (fs.existsSync(filePath)) {
+        const ext = path.extname(filePath).toLowerCase();
+        const contentType = mimeTypes[ext] || 'application/octet-stream';
+        const content = await fs.promises.readFile(filePath);
+        return reply.type(contentType).send(content);
+      }
+      return reply.status(404).send('Not Found');
+    });
   }
 
   return app;

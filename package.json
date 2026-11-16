@@ -15,7 +15,6 @@
   "dependencies": {
     "@electric-sql/pglite": "^0.5.16",
     "@fastify/cors": "^11.4.3",
-    "@fastify/static": "^10.1.11",
     "@fastify/swagger": "^9.9.5",
     "@fastify/swagger-ui": "^6.1.4",
     "drizzle-orm": "^0.45.4",
