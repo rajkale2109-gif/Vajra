@@ -49,7 +49,7 @@ class LogMailer implements MailerService {
 }
 
 class SmtpMailer implements MailerService {
-  private transporter: nodemailer.Transporter;
+  private transporter: any;
   private log: SendEmailOptions[] = [];
 
   constructor(isMailhog = false) {

@@ -192,13 +192,13 @@ export async function seedDatabase(databaseUrl?: string) {
           date,
           campaignId: c.id,
           adSetId: null,
-          spend: 0,
+          spend: '0',
           impressions: 0,
           clicks: 0,
           reach: 0,
           engagements: 0,
           conversions: 0,
-          revenue: 0,
+          revenue: '0',
           dataState: 'complete',
         });
       }

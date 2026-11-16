@@ -330,7 +330,7 @@ export function generateSampleData() {
     if (c.nm) return;
     const f = 1.4 + rnd() * 1.2;
     const e0 = c.obj === "Engagement" ? 0.055 : 0.012;
-    const cr = { Leads: 0.07, "App Promotion": 0.09, Sales: 0.0009 }[c.obj];
+    const cr = ({ Leads: 0.07, 'App Promotion': 0.09, Sales: 0.0009 } as Record<string, number | undefined>)[c.obj];
 
     c.reach = Math.round(c.impr / f);
     c.pReach = Math.round(c.pImpr / (f * (0.95 + rnd() * 0.1)));
