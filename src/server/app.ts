@@ -8,6 +8,7 @@ import { overviewRoutes } from './routes/overview.js';
 import { campaignsRoutes } from './routes/campaigns.js';
 import { workspaceRoutes, installErrorHandler } from './routes/workspace.js';
 import { eventsRoutes } from './routes/events.js';
+import { timeseriesRoutes } from './routes/timeseries.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -73,6 +74,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       await apiServer.register(campaignsRoutes);
       await apiServer.register(workspaceRoutes);
       await apiServer.register(eventsRoutes);
+      await apiServer.register(timeseriesRoutes);
     },
     { prefix: '/api' }
   );

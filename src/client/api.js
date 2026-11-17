@@ -42,6 +42,7 @@ export const api = {
   getCampaigns: (params) => apiRequest(`/campaigns${qs(params)}`),
   getCampaign: (id, params) => apiRequest(`/campaigns/${id}${qs(params)}`),
   getAdSets: () => apiRequest('/adsets'),
+  getTimeseries: (params) => apiRequest(`/timeseries${qs(params)}`),
 
   bulkStatus: (body) => apiRequest('/bulk/status', json('POST', body)),
 

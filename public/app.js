@@ -1,4 +1,5 @@
 import { api, setSession } from './api.js';
+import { lineChart, barChart, hbars, divBars, donut, spark, gauge, legend, initChartHover, PALETTE, PLATFORM_COLOR } from './charts.js';
 
 const $ = (s) => document.querySelector(s);
 const e = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -47,8 +48,8 @@ const stb = (s) =>
 const sevc = (k) => (k === 'High' ? 'bad' : k === 'Info' ? 'info' : 'warn');
 const NO_ADSETS = 'No ad sets configured yet — metrics unavailable.';
 
-const kpi = (t, v, tip, sub, d) =>
-  `<div class=card title="${e(tip)}"><div class=sub>${t} ⓘ</div><div class=kv>${v}</div><div>${d || ''} <span class=sub>${sub || ''}</span></div></div>`;
+const kpi = (t, v, tip, sub, d, spk) =>
+  `<div class=card title="${e(tip)}"><div class=sub>${t} ⓘ</div><div class=kv>${v}</div><div>${d || ''} <span class=sub>${sub || ''}</span></div>${spk || ''}</div>`;
 
 const sel = (set, v, opts, id) =>
   `<select data-set="${set}" ${id ? 'id=' + id : ''}>${opts
@@ -173,6 +174,7 @@ async function loadData(opts = {}) {
     }
     if (S.pg === 'activity') S.activityData = await api.getActivity(S.activityType);
     if (S.pg === 'metrics') S.metricsData = await api.getSuccessMetrics({ days: 7, export_baseline: S.exportBaseline });
+    await refreshGraphs();
   } catch (err) {
     toast(`Error loading data: ${err.message}`, 1);
   } finally {
@@ -190,6 +192,317 @@ async function guarded(fn, okMsg) {
     toast(err.message, 1);
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Graphs ("View graph") — every page has one. Charts are plain SVG/HTML (see charts.js).
+// ---------------------------------------------------------------------------
+const G = { open: {}, metric: 'spend', tblMetric: 'spend', ts: {} };
+
+const GM = {
+  spend: { label: 'Spend', fmt: inr, good: 0, zero: true },
+  impressions: { label: 'Impressions', fmt: num, good: 1, zero: true },
+  clicks: { label: 'Clicks', fmt: num, good: 1, zero: true },
+  ctr: { label: 'CTR', fmt: pcf, good: 1, zero: false },
+  cpc: { label: 'CPC', fmt: inr2, good: -1, zero: false },
+};
+
+const rel = (c, p) => (c == null || p == null || p === 0 ? null : ((c - p) / p) * 100);
+
+// Sum daily points; CTR / CPC are recomputed from the sums (never averaged). All-missing => null, not 0.
+function aggPts(pts) {
+  const u = pts.filter((p) => p.spend != null);
+  if (!u.length) return null;
+  const s = (k) => u.reduce((a, p) => a + (p[k] || 0), 0);
+  const spend = s('spend');
+  const impressions = s('impressions');
+  const clicks = s('clicks');
+  return { spend, impressions, clicks, ctr: impressions > 0 ? (clicks / impressions) * 100 : null, cpc: clicks > 0 ? spend / clicks : null };
+}
+
+const graphBtn = (key, label = 'View graph') =>
+  `<button class="btn gb ${G.open[key] ? 'p' : ''}" data-a=graph data-k="${e(key)}" aria-expanded="${!!G.open[key]}" title="Show or hide the graph for this section">📈 ${G.open[key] ? 'Hide graph' : label}</button>`;
+
+const mseg = (active, action) =>
+  `<div class=mseg role=group aria-label="Metric">${Object.entries(GM)
+    .map(([k, v]) => `<button class="${active === k ? 'a' : ''}" data-a=${action} data-v=${k} aria-pressed="${active === k}">${v.label}</button>`)
+    .join('')}</div>`;
+
+const gpanel = (title, sub, body) => `<div class=gp><div class=row><h2>${e(title)}</h2><span class=sub>${sub || ''}</span></div>${body}</div>`;
+
+const tsScope = (k) =>
+  k === 'ov' ? {} : k === 'sel' ? { campaignIds: S.sel.join(',') } : k === 'drill' ? { campaignId: S.modal?.id } : k.startsWith('grp:') ? { groupId: k.slice(4) } : null;
+
+async function loadTs(k, force) {
+  const sc = tsScope(k);
+  if (!sc) return;
+  if (k === 'sel' && !S.sel.length) {
+    delete G.ts.sel;
+    return;
+  }
+  if (k === 'drill' && S.modal?.id == null) return;
+  const params = { ...dateParams(), ...sc };
+  const sig = JSON.stringify(params);
+  if (!force && G.ts[k] && G.ts[k]._sig === sig) return;
+  try {
+    G.ts[k] = { ...(await api.getTimeseries(params)), _sig: sig };
+  } catch (err) {
+    G.ts[k] = { error: err.message, _sig: sig };
+  }
+}
+
+async function refreshGraphs() {
+  const jobs = [];
+  if (S.pg === 'overview') jobs.push(loadTs('ov'));
+  if ((S.pg === 'overview' || S.pg === 'campaigns') && G.open.tbl && S.sel.length) jobs.push(loadTs('sel'));
+  if (S.pg === 'groups') for (const k of Object.keys(G.open)) if (k.startsWith('grp:') && G.open[k]) jobs.push(loadTs(k));
+  if (S.modal?.type === 'drill' && G.open.drill) jobs.push(loadTs('drill'));
+  await Promise.all(jobs);
+}
+
+let selTimer;
+function schedSelGraph() {
+  if (!G.open.tbl) return;
+  clearTimeout(selTimer);
+  selTimer = setTimeout(async () => {
+    await loadTs('sel');
+    render();
+  }, 250);
+}
+
+const dayLabels = (ts) => ts.days.map((d) => (d.current ? fd(d.current) : d.previous ? `${fd(d.previous)} (prev)` : ''));
+
+function trendBlock(ts, metric) {
+  if (!ts) return '<div class=emp style="padding:24px">Loading chart…</div>';
+  if (ts.error) return `<div class=emp style="padding:24px">Couldn't load the chart: ${e(ts.error)}</div>`;
+  const cur = ts.total.current;
+  const prv = ts.total.previous;
+  const series = [
+    { name: `Current (${fr(ts.dates.currentStart, ts.dates.currentEnd)})`, color: 'var(--pri)', values: cur.map((p) => p[metric]), states: cur.map((p) => p.state), labels: cur.map((p) => (p.date ? fd(p.date) : '')) },
+    { name: `Previous (${fr(ts.dates.previousStart, ts.dates.previousEnd)})`, color: 'var(--neu)', dash: true, values: prv.map((p) => p[metric]), states: prv.map((p) => p.state), labels: prv.map((p) => (p.date ? fd(p.date) : '')) },
+  ];
+  const all = [...cur, ...prv];
+  const notes = [];
+  if (all.some((p) => p.state === 'provisional')) notes.push('Hollow dot = partial day (today, data through 09:00).');
+  if (all.some((p) => p.state === 'delayed')) notes.push('Hollow dot = delayed sync (Google), may be incomplete.');
+  if (cur.some((p) => p.state === 'missing' && p.date)) notes.push('Grey band = no data. It is a gap, not zero.');
+  return `${legend(series.map((s) => ({ name: s.name, color: s.color, dash: s.dash })))}${lineChart({ series, xLabels: dayLabels(ts), fmt: GM[metric].fmt, zero: GM[metric].zero, area: true, title: `${GM[metric].label} per day, current vs previous period` })}${notes.length ? `<div class=gn>${notes.join(' ')}</div>` : ''}`;
+}
+
+function platformBlock(ts, metric) {
+  if (!ts || ts.error || ts.byPlatform.length < 2) return '';
+  const series = ts.byPlatform.map((p) => ({ name: p.label, color: PLATFORM_COLOR[p.key] || PALETTE[0], values: p.current.map((x) => x[metric]), states: p.current.map((x) => x.state), labels: p.current.map((x) => (x.date ? fd(x.date) : '')) }));
+  const shares = ts.byPlatform.map((p) => ({ label: p.label, color: PLATFORM_COLOR[p.key] || PALETTE[0], value: aggPts(p.current)?.spend ?? 0 }));
+  return `<div class=gc style="margin-top:14px"><div><div class=gl2>${GM[metric].label} by platform · current period</div>${legend(series)}${lineChart({ series, xLabels: dayLabels(ts), fmt: GM[metric].fmt, zero: GM[metric].zero, h: 200, title: `${GM[metric].label} per day by platform` })}</div><div><div class=gl2>Spend share by platform</div>${donut(shares, { center: inr(shares.reduce((a, s) => a + s.value, 0)), sub: 'total spend', fmt: inr })}</div></div>`;
+}
+
+function rankRows(pairs, metric) {
+  const m = GM[metric];
+  return pairs
+    .map((p) => {
+      const c = aggPts(p.current);
+      const pv = aggPts(p.previous);
+      return { label: p.label, platform: p.platform, c: c?.[metric] ?? null, pv: pv?.[metric] ?? null, ch: rel(c?.[metric], pv?.[metric]) };
+    })
+    .sort((a, b) => (b.c ?? -1) - (a.c ?? -1))
+    .map((r) => ({
+      label: r.label,
+      labelHtml: `${r.platform ? pl(r.platform) + ' ' : ''}${e(r.label)}`,
+      value: r.c,
+      prev: r.pv,
+      valueText: m.fmt(r.c),
+      prevText: m.fmt(r.pv),
+      color: r.platform ? PLATFORM_COLOR[r.platform] : undefined,
+      delta: r.pv ? dl(r.ch, m.good) : '<span class=n>No baseline</span>',
+    }));
+}
+
+function pairBars(ts, metric, title, pairs) {
+  if (!ts || ts.error || !pairs?.length) return '';
+  return `<div><div class=gl2>${title} · ${GM[metric].label}</div>${legend([{ name: 'Current', color: 'var(--pri)' }, { name: 'Previous (thin bar)', color: 'var(--neu)' }])}${hbars(rankRows(pairs, metric))}</div>`;
+}
+
+// ---- Overview ---------------------------------------------------------------
+function ovGraph() {
+  const ts = G.ts.ov;
+  const m = G.metric;
+  return gpanel(
+    'Performance trends',
+    'Daily, current vs previous period aligned by day. Hover for exact values.',
+    `${mseg(m, 'gmetric')}<div class="gc one"><div>${trendBlock(ts, m)}</div></div>${platformBlock(ts, m)}<div class="gc one" style="margin-top:14px">${pairBars(ts, m, 'Top campaigns by spend', ts?.byCampaign)}</div>`
+  );
+}
+
+// ---- Issues (triage) ---------------------------------------------------------
+function issuesGraph(is) {
+  if (!is?.length) return gpanel('Open issues', '', '<div class=emp>No open issues to chart.</div>');
+  const cnt = (f) => is.reduce((a, i) => ((a[f(i)] = (a[f(i)] || 0) + 1), a), {});
+  const sev = cnt((i) => i.severity);
+  const plat = cnt((i) => i.platform);
+  const met = Object.entries(cnt((i) => i.metric)).sort((a, b) => b[1] - a[1]);
+  const byCamp = Object.entries(cnt((i) => i.campaignName)).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const sevCol = { High: 'var(--bad)', Medium: 'var(--warn)', Info: 'var(--info)' };
+  return gpanel(
+    'Open issues',
+    'What is wrong, where, and how bad.',
+    `<div class=gc><div><div class=gl2>By severity</div>${donut(['High', 'Medium', 'Info'].map((k) => ({ label: k, value: sev[k] || 0, color: sevCol[k] })), { center: String(is.length), sub: 'open' })}</div><div><div class=gl2>By platform</div>${donut(Object.entries(plat).map(([k, v]) => ({ label: k, value: v, color: PLATFORM_COLOR[k] || PALETTE[3] })), { center: String(is.length), sub: 'open' })}</div></div>
+<div class=gc style="margin-top:14px"><div><div class=gl2>By metric</div>${hbars(met.map(([k, v]) => ({ label: k, value: v, valueText: String(v) })))}</div><div><div class=gl2>Campaigns with most issues</div>${hbars(byCamp.map(([k, v]) => ({ label: k, value: v, valueText: String(v), color: 'var(--bad)' })))}</div></div>`
+  );
+}
+
+// ---- Campaign table ------------------------------------------------------------
+function tblGraph() {
+  const d = S.campaignsData;
+  if (!d) return '';
+  const metric = G.tblMetric;
+  const m = GM[metric];
+  const items = d.items;
+  const chg = (r) => r.changes[metric]?.relativePct ?? null;
+  const rows = items.map((r) => {
+    const gone = unavailable(r);
+    return {
+      label: r.name,
+      labelHtml: `${pl(r.platform)} ${e(r.name)}`,
+      value: gone ? null : r.current[metric],
+      prev: gone ? null : r.previous[metric],
+      valueText: m.fmt(r.current[metric]),
+      prevText: m.fmt(r.previous[metric]),
+      color: PLATFORM_COLOR[r.platform],
+      delta: gone ? '' : r.previous[metric] ? dl(chg(r), m.good) : '<span class=n>No baseline</span>',
+    };
+  });
+  const changeRows = items
+    .map((r) => {
+      const gone = unavailable(r);
+      const unrel = (metric === 'ctr' || metric === 'cpc') && !r.reliability.isReliable;
+      const v = gone || unrel ? null : chg(r);
+      return { label: r.name, value: v, good: m.good, valueText: sg(v), why: gone ? 'Metrics unavailable' : unrel ? r.reliability.flagText || 'Insufficient data' : 'No baseline' };
+    })
+    .sort((a, b) => (b.value ?? -1e9) - (a.value ?? -1e9));
+  const selTs = G.ts.sel;
+  const selPart = S.sel.length
+    ? `<div style="margin-top:14px"><div class=gl2>Daily trend · ${S.sel.length} selected campaign${S.sel.length === 1 ? '' : 's'} combined</div>${trendBlock(selTs, metric)}</div>`
+    : '<div class=gn style="margin-top:10px">Tip: tick campaigns in the table to see their combined daily trend here.</div>';
+  return gpanel(
+    'Campaign comparison',
+    `The ${items.length} campaign${items.length === 1 ? '' : 's'} in this view (follows your filters and page).`,
+    `${mseg(metric, 'tmetric')}<div class=gc><div><div class=gl2>${m.label} · current vs previous</div>${legend([{ name: 'Current', color: 'var(--pri)' }, { name: 'Previous (thin bar)', color: 'var(--neu)' }])}${hbars(rows, { empty: 'No campaigns match these filters.' })}</div><div><div class=gl2>${m.label} change vs previous period</div><div class=sub style="margin-bottom:6px">Green = good direction, red = bad. Unreliable CTR/CPC is left blank, never drawn as 0.</div>${divBars(changeRows)}</div></div>${selPart}`
+  );
+}
+
+// ---- Campaign drilldown ----------------------------------------------------------
+function drillGraph() {
+  const mdl = S.modal;
+  const ts = G.ts.drill;
+  const metric = G.metric;
+  const m = GM[metric];
+  const ads = mdl.data?.adSets || [];
+  const adRows = ads.map((a) => {
+    const gone = a.reliability.reasonCode === 'f';
+    const unrel = (metric === 'ctr' || metric === 'cpc') && !a.reliability.isReliable;
+    const ch = a.changes[metric]?.relativePct ?? null;
+    return { a, gone, unrel, ch };
+  });
+  const bars = hbars(
+    adRows.map(({ a, gone }, i) => ({ label: a.name, value: gone ? null : a.current[metric], prev: gone ? null : a.previous[metric], valueText: m.fmt(a.current[metric]), prevText: m.fmt(a.previous[metric]), color: PALETTE[i % PALETTE.length], delta: gone ? '' : a.previous[metric] ? dl(adRows[i].ch, m.good) : '<span class=n>No baseline</span>' })),
+    { empty: 'No ad sets to compare yet.' }
+  );
+  const deltas = divBars(adRows.map(({ a, gone, unrel, ch }) => ({ label: a.name, value: gone || unrel ? null : ch, good: m.good, valueText: sg(ch), why: gone ? 'Sync failed' : unrel ? 'Insufficient data' : 'No baseline' })));
+  const lines =
+    ts && !ts.error && ts.byAdSet.length
+      ? (() => {
+          const ser = ts.byAdSet.slice(0, 6).map((p, i) => ({ name: p.label, color: PALETTE[i], values: p.current.map((x) => x[metric]), states: p.current.map((x) => x.state), labels: p.current.map((x) => (x.date ? fd(x.date) : '')) }));
+          return `<div style="margin-top:14px"><div class=gl2>${m.label} per day by ad set · current period</div>${legend(ser)}${lineChart({ series: ser, xLabels: dayLabels(ts), fmt: m.fmt, zero: m.zero, h: 200, title: `${m.label} per day by ad set` })}</div>`;
+        })()
+      : '';
+  return `<div class="gp" style="margin-top:12px"><div class=row><h2>Campaign graph</h2><span class=sub>Daily trend and ad-set comparison</span></div>${mseg(metric, 'gmetric')}${trendBlock(ts, metric)}${lines}<div class=gc style="margin-top:14px"><div><div class=gl2>Ad sets · ${m.label}</div>${bars}</div><div><div class=gl2>Change vs previous</div>${deltas}</div></div></div>`;
+}
+
+// ---- Groups ------------------------------------------------------------------------
+function groupGraph(g) {
+  const k = 'grp:' + g.id;
+  const ts = G.ts[k];
+  const m = G.metric;
+  const changeRows = ts?.byCampaign?.length
+    ? ts.byCampaign.map((p) => {
+        const c = aggPts(p.current);
+        const pv = aggPts(p.previous);
+        const ch = (m === 'ctr' || m === 'cpc') && c && c.impressions < 1000 ? null : rel(c?.[m], pv?.[m]);
+        return { label: p.label, value: ch, good: GM[m].good, valueText: sg(ch), why: 'No baseline / low volume' };
+      })
+    : [];
+  return gpanel(
+    `${g.name} — graph`,
+    'Combined daily trend and each campaign’s contribution.',
+    `${mseg(m, 'gmetric')}${trendBlock(ts, m)}<div class="gc one" style="margin-top:14px">${pairBars(ts, m, 'Campaigns in this group', ts?.byCampaign) || '<div class=emp>No campaigns in this group yet.</div>'}</div>${changeRows.length ? `<div class="gc one" style="margin-top:14px"><div class=gl2>${GM[m].label} change by campaign</div>${divBars(changeRows)}</div>` : ''}`
+  );
+}
+
+// ---- Alerts ----------------------------------------------------------------------------
+function alertsGraph(d) {
+  const T_ = d.triggers;
+  const R = d.rules;
+  const statusOf = (t) => (t.status === 'open' || t.status === 'opened' ? 'Needs attention' : t.status === 'dismissed' ? 'Dismissed' : t.status === 'recovered' ? 'Recovered' : t.status);
+  const stat = {};
+  T_.forEach((t) => (stat[statusOf(t)] = (stat[statusOf(t)] || 0) + 1));
+  const statCol = { 'Needs attention': 'var(--bad)', Dismissed: 'var(--neu)', Recovered: 'var(--ok)' };
+  const fbc = { valid: 0, misleading: 0, not_actionable: 0, unreviewed: 0 };
+  T_.forEach((t) => (fbc[t.feedback || 'unreviewed'] = (fbc[t.feedback || 'unreviewed'] || 0) + 1));
+  const perRule = {};
+  T_.forEach((t) => (perRule[t.ruleName] = (perRule[t.ruleName] || 0) + 1));
+  const perDay = {};
+  T_.forEach((t) => {
+    const day = (t.triggeredAt || '').slice(0, 10);
+    if (day) perDay[day] = (perDay[day] || 0) + 1;
+  });
+  const days_ = Object.keys(perDay).sort();
+  const ruleMetric = {};
+  R.forEach((r) => (ruleMetric[r.metricLabel] = (ruleMetric[r.metricLabel] || 0) + 1));
+  if (!T_.length && !R.length) return gpanel('Alerts overview', '', '<div class=emp>No alerts or rules yet.</div>');
+  return gpanel(
+    'Alerts overview',
+    `${T_.length} trigger${T_.length === 1 ? '' : 's'} across ${R.length} rule${R.length === 1 ? '' : 's'}.`,
+    `<div class=gc><div><div class=gl2>Triggers by status</div>${donut(Object.entries(stat).map(([k, v]) => ({ label: k, value: v, color: statCol[k] || PALETTE[3] })), { center: String(T_.length), sub: 'triggers' })}</div><div><div class=gl2>Were alerts right? (planner reviews)</div>${donut([{ label: 'Valid', value: fbc.valid, color: 'var(--ok)' }, { label: 'Misleading', value: fbc.misleading, color: 'var(--bad)' }, { label: 'Not actionable', value: fbc.not_actionable, color: 'var(--warn)' }, { label: 'Not reviewed yet', value: fbc.unreviewed, color: 'var(--neu)' }], { center: String(T_.length - fbc.unreviewed), sub: 'reviewed' })}</div></div>
+<div class=gc style="margin-top:14px"><div><div class=gl2>Triggers by rule</div>${hbars(Object.entries(perRule).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ label: k, value: v, valueText: String(v), color: 'var(--warn)' })), { empty: 'No triggers yet.' })}</div><div><div class=gl2>Rules by metric watched</div>${hbars(Object.entries(ruleMetric).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ label: k, value: v, valueText: String(v) })), { empty: 'No rules yet.' })}</div></div>
+${days_.length ? `<div class="gc one" style="margin-top:14px"><div class=gl2>Triggers per day</div>${barChart({ labels: days_.map(fd), values: days_.map((x) => perDay[x]), fmt: (v) => `${v} trigger${v === 1 ? '' : 's'}`, color: 'var(--warn)', h: 170, title: 'Alert triggers per day' })}</div>` : ''}`
+  );
+}
+
+// ---- Activity ----------------------------------------------------------------------------
+function activityGraph(d) {
+  const it = d.items;
+  if (!it.length) return gpanel('Activity overview', '', '<div class=emp>No activity to chart.</div>');
+  const cnt = (f) => it.reduce((a, i) => ((a[f(i)] = (a[f(i)] || 0) + 1), a), {});
+  const byType = Object.entries(cnt((i) => i.type));
+  const byUser = Object.entries(cnt((i) => i.userName)).sort((a, b) => b[1] - a[1]);
+  const byDay = cnt((i) => (/^([A-Za-z]{3} \d{1,2})/.exec(i.timestampText) || [])[1] || '');
+  delete byDay[''];
+  const dayKeys = Object.keys(byDay).reverse(); // API is newest-first
+  const tcol = { Campaign: PALETTE[0], Group: PALETTE[1], Alert: PALETTE[2], Selection: PALETTE[3], System: PALETTE[7] };
+  return gpanel(
+    'Activity overview',
+    `${it.length} change${it.length === 1 ? '' : 's'}${S.activityType ? ` of type “${e(S.activityType)}”` : ''}.`,
+    `<div class=gc><div><div class=gl2>By type</div>${donut(byType.map(([k, v]) => ({ label: k, value: v, color: tcol[k] || PALETTE[4] })), { center: String(it.length), sub: 'changes' })}</div><div><div class=gl2>By planner</div>${hbars(byUser.map(([k, v]) => ({ label: k, value: v, valueText: String(v) })))}</div></div>${dayKeys.length ? `<div class="gc one" style="margin-top:14px"><div class=gl2>Changes per day</div>${barChart({ labels: dayKeys, values: dayKeys.map((k) => byDay[k]), fmt: (v) => `${v} change${v === 1 ? '' : 's'}`, h: 170, title: 'Changes per day' })}</div>` : ''}`
+  );
+}
+
+// ---- Success metrics -----------------------------------------------------------------------
+function metricsGraph(m) {
+  const dr = m.drivers;
+  const g = m.guardrail;
+  const th = m.thresholds || {};
+  const ns = m.northStar;
+  const mw = m.manualWorkflow;
+  const reviewedOk = Math.max(0, g.reviewedTriggeredAlerts - g.misleadingAlerts);
+  const rows = [
+    { label: 'A · Detect → investigate', value: ns.detectToInvestigateMedianMinutes, valueText: dur(ns.detectToInvestigateMedianMinutes), color: 'var(--pri)' },
+    { label: 'B · Governance opened → issue opened', value: ns.activeSessionMedianMinutes, valueText: dur(ns.activeSessionMedianMinutes), color: PALETTE[1] },
+  ];
+  return gpanel(
+    'Success metrics at a glance',
+    'Bars show where each measure sits; the amber tick is the proposed threshold (not a benchmark).',
+    `<div class=gc><div>${gauge({ label: 'Weekly governance action rate', value: dr.weeklyGovernanceActionRate, text: pctv(dr.weeklyGovernanceActionRate) })}${gauge({ label: 'Group adoption', value: dr.groupAdoptionRate, text: pctv(dr.groupAdoptionRate) })}${gauge({ label: 'Alert action rate', value: dr.alertActionRate, text: pctv(dr.alertActionRate), threshold: th.alertActionRateFloor, thresholdText: th.alertActionRateFloor != null ? `Floor ${th.alertActionRateFloor}%` : '', goodWhen: 'high' })}${gauge({ label: 'Alert false-positive rate', value: g.alertFalsePositiveRate, text: pctv(g.alertFalsePositiveRate), threshold: th.falsePositiveRateLimit, thresholdText: th.falsePositiveRateLimit != null ? `Limit ${th.falsePositiveRateLimit}%` : '', goodWhen: 'low' })}${mw.reductionPct != null ? gauge({ label: 'Manual export reduction vs baseline', value: mw.reductionPct, text: pctv(mw.reductionPct), threshold: th.exportReductionTarget, thresholdText: th.exportReductionTarget != null ? `Target ${th.exportReductionTarget}%` : '', goodWhen: 'high' }) : ''}</div><div><div class=gl2>Time to investigate (median)</div>${hbars(rows, { empty: 'No investigated issues yet.' })}<div class=gl2 style="margin-top:14px">Reviewed alerts</div>${donut([{ label: 'Valid / actionable', value: reviewedOk, color: 'var(--ok)' }, { label: 'Misleading', value: g.misleadingAlerts, color: 'var(--bad)' }], { center: String(g.reviewedTriggeredAlerts), sub: 'reviewed' })}</div></div>`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +536,7 @@ function triage(is) {
     }
   }
 
-  return `<div class=card><div class=row><h2>Needs your attention</h2>${['High', 'Medium', 'Info'].map((k) => (n[k] ? `<span class="bd ${sevc(k)}">${n[k]} ${k}</span>` : '')).join('')}<span class=sub>${is.length} open · most severe first</span><span class=sp></span>${is.length ? '<button class=btn data-a=attTab>Show these in table ↓</button>' : ''}</div><div style="margin-top:10px">${is.length ? sh.map((i) => `<div class="iss ${i.severity}" style="padding:7px 10px"><span class="bd ${sevc(i.severity)}">${i.severity}</span><div class=sp><b>${e(i.campaignName)}</b> ${pl(i.platform)} · ${e(i.metric)}: <b>${e(i.changeDisplay)}</b> <span class=sub>· detected ${e(i.detectedAt)}</span><div class=sub>${e(i.whyText)}</div></div><button class="btn p" data-a=openIssue data-id="${e(i.id)}" data-cid="${i.campaignId}">View campaign</button><button class=btn data-a=revIssue data-id="${e(i.id)}">Mark reviewed</button><button class=btn data-a=disIssue data-id="${e(i.id)}">Dismiss</button></div>`).join('') : '<div class=emp>All caught up — no open issues.</div>'}${is.length > 4 ? `<button class=btn data-a=issAll>${S.issAll ? 'Show top 4 only' : `Show all ${is.length} issues`}</button>` : ''}</div></div>`;
+  return `<div class=card><div class=row><h2>Needs your attention</h2>${['High', 'Medium', 'Info'].map((k) => (n[k] ? `<span class="bd ${sevc(k)}">${n[k]} ${k}</span>` : '')).join('')}<span class=sub>${is.length} open · most severe first</span><span class=sp></span>${graphBtn('iss')}${is.length ? '<button class=btn data-a=attTab>Show these in table ↓</button>' : ''}</div>${G.open.iss ? `<div style="margin-top:10px">${issuesGraph(is)}</div>` : ''}<div style="margin-top:10px">${is.length ? sh.map((i) => `<div class="iss ${i.severity}" style="padding:7px 10px"><span class="bd ${sevc(i.severity)}">${i.severity}</span><div class=sp><b>${e(i.campaignName)}</b> ${pl(i.platform)} · ${e(i.metric)}: <b>${e(i.changeDisplay)}</b> <span class=sub>· detected ${e(i.detectedAt)}</span><div class=sub>${e(i.whyText)}</div></div><button class="btn p" data-a=openIssue data-id="${e(i.id)}" data-cid="${i.campaignId}">View campaign</button><button class=btn data-a=revIssue data-id="${e(i.id)}">Mark reviewed</button><button class=btn data-a=disIssue data-id="${e(i.id)}">Dismiss</button></div>`).join('') : '<div class=emp>All caught up — no open issues.</div>'}${is.length > 4 ? `<button class=btn data-a=issAll>${S.issAll ? 'Show top 4 only' : `Show all ${is.length} issues`}</button>` : ''}</div></div>`;
 }
 
 function nameCellNote(r) {
@@ -246,8 +559,8 @@ function table() {
   const tabBtn = (k, l, count) => `<button class="${T.tab === k ? 'a' : ''}" data-a=tab data-v=${k}>${l} <span class=sub>${count}</span></button>`;
 
   return `<div class=card id=tbl><div class=tabs role=tablist>${tabBtn('all', 'All campaigns', tabCounts.all)}${tabBtn('att', 'Needs attention', tabCounts.att)}${tabBtn('imp', 'Improving', tabCounts.imp)}${tabBtn('dec', 'Declining', tabCounts.dec)}${tabBtn('Paused', 'Paused', tabCounts.Paused)}${tabBtn('Ended', 'Ended', tabCounts.Ended)}</div>
-<div class=row style="margin-bottom:10px"><input id=sq data-set=T.q value="${e(T.q)}" placeholder="Search campaign name…" aria-label="Search campaigns" style="width:220px">${sel('T.plat', T.plat, [['', 'All platforms'], 'Meta', 'Google'])}${sel('T.obj', T.obj, [['', 'All objectives'], 'Awareness', 'Traffic', 'Engagement', 'Leads', 'Sales', 'App Promotion'])}${sel('T.st', T.st, [['', 'All statuses'], 'Active', 'Learning', 'Paused', 'Ended'])}${sel('T.perf', T.perf, [['', 'Any performance'], ['imp', 'Improving CTR'], ['dec', 'Declining CTR']])}<button class=btn data-a=clr>Clear filters</button><span class=sp></span><button class=btn data-a=exportCsv title="Download the current view (or your selection) as CSV">⇩ Export CSV</button><div style="position:relative" data-dd><button class=btn data-a=cm>Columns ▾</button>${T.cm ? `<div class=dd style="width:200px">${COLS.map((c) => `<label style="display:flex;gap:8px;padding:4px"><input type=checkbox data-a=colv data-k=${c[0]} ${T.hid.includes(c[0]) ? '' : 'checked'}>${c[1]}</label>`).join('')}</div>` : ''}</div></div>
-${items.length ? `<div class="tw cs"><table><caption class=sr>Campaign performance, current vs previous period</caption><thead><tr><th><input type=checkbox aria-label="Select all visible" data-a=selAll ${allSel ? 'checked' : ''} ${!allSel && someSel ? 'data-ind=1' : ''}></th><th scope=col aria-sort="${T.sort === 'name' ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=name>Campaign ${T.sort === 'name' ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th><th>Platform</th><th>Objective</th><th>Status</th>${cols.map((c) => `<th scope=col class=r aria-sort="${T.sort === c[0] ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=${c[0]}>${c[1]} ${T.sort === c[0] ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th>`).join('')}<th>Updated</th></tr></thead><tbody>${items.map((r) => `<tr class="${S.sel.includes(r.campaignId) ? 'sl' : ''}"><td><input type=checkbox aria-label="Select ${e(r.name)}" data-a=sel data-id=${r.campaignId} ${S.sel.includes(r.campaignId) ? 'checked' : ''}></td><td><button class=lnk data-a=openCamp data-id=${r.campaignId}>${e(r.name)}</button><div class=raw title="${e(r.raw)}">${e(r.raw)}</div>${nameCellNote(r)}${(r.issues || []).map((i) => `<span class="bd ${sevc(i.severity)}" title="${e(i.whyText)}">⚑ ${e(i.metric)} ${e(i.changeDisplay)}</span>`).join(' ')}</td><td>${pl(r.platform)}</td><td>${e(r.objective)}</td><td>${stb(r.status)}</td>${cols.map((c) => `<td class=r>${unavailable(r) ? '<span class=n title="Metrics unavailable">—</span>' : c[3](r) + (c[4] ? c[4](r) : '')}</td>`).join('')}<td class=sub>${r.reliability.reasonCode === 'd' ? '<span class=w>⏱ ' : '<span>'}${e(r.lastSync)}</span></td></tr>`).join('')}</tbody></table></div>
+<div class=row style="margin-bottom:10px"><input id=sq data-set=T.q value="${e(T.q)}" placeholder="Search campaign name…" aria-label="Search campaigns" style="width:220px">${sel('T.plat', T.plat, [['', 'All platforms'], 'Meta', 'Google'])}${sel('T.obj', T.obj, [['', 'All objectives'], 'Awareness', 'Traffic', 'Engagement', 'Leads', 'Sales', 'App Promotion'])}${sel('T.st', T.st, [['', 'All statuses'], 'Active', 'Learning', 'Paused', 'Ended'])}${sel('T.perf', T.perf, [['', 'Any performance'], ['imp', 'Improving CTR'], ['dec', 'Declining CTR']])}<button class=btn data-a=clr>Clear filters</button><span class=sp></span>${graphBtn('tbl')}<button class=btn data-a=exportCsv title="Download the current view (or your selection) as CSV">⇩ Export CSV</button><div style="position:relative" data-dd><button class=btn data-a=cm>Columns ▾</button>${T.cm ? `<div class=dd style="width:200px">${COLS.map((c) => `<label style="display:flex;gap:8px;padding:4px"><input type=checkbox data-a=colv data-k=${c[0]} ${T.hid.includes(c[0]) ? '' : 'checked'}>${c[1]}</label>`).join('')}</div>` : ''}</div></div>
+${G.open.tbl ? tblGraph() : ''}${items.length ? `<div class="tw cs"><table><caption class=sr>Campaign performance, current vs previous period</caption><thead><tr><th><input type=checkbox aria-label="Select all visible" data-a=selAll ${allSel ? 'checked' : ''} ${!allSel && someSel ? 'data-ind=1' : ''}></th><th scope=col aria-sort="${T.sort === 'name' ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=name>Campaign ${T.sort === 'name' ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th><th>Platform</th><th>Objective</th><th>Status</th>${cols.map((c) => `<th scope=col class=r aria-sort="${T.sort === c[0] ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=${c[0]}>${c[1]} ${T.sort === c[0] ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th>`).join('')}<th>Updated</th></tr></thead><tbody>${items.map((r) => `<tr class="${S.sel.includes(r.campaignId) ? 'sl' : ''}"><td><input type=checkbox aria-label="Select ${e(r.name)}" data-a=sel data-id=${r.campaignId} ${S.sel.includes(r.campaignId) ? 'checked' : ''}></td><td><button class=lnk data-a=openCamp data-id=${r.campaignId}>${e(r.name)}</button><div class=raw title="${e(r.raw)}">${e(r.raw)}</div>${nameCellNote(r)}${(r.issues || []).map((i) => `<span class="bd ${sevc(i.severity)}" title="${e(i.whyText)}">⚑ ${e(i.metric)} ${e(i.changeDisplay)}</span>`).join(' ')}</td><td>${pl(r.platform)}</td><td>${e(r.objective)}</td><td>${stb(r.status)}</td>${cols.map((c) => `<td class=r>${unavailable(r) ? '<span class=n title="Metrics unavailable">—</span>' : c[3](r) + (c[4] ? c[4](r) : '')}</td>`).join('')}<td class=sub>${r.reliability.reasonCode === 'd' ? '<span class=w>⏱ ' : '<span>'}${e(r.lastSync)}</span></td></tr>`).join('')}</tbody></table></div>
 <div class=row style="margin-top:8px"><span class=sub>${pagination.total} campaigns · ${S.sel.length} selected</span><span class=sp></span>Rows ${sel('T.size', T.size, [10, 25, 50])}<button class=btn data-a=pg data-d=-1 ${pagination.page ? '' : 'disabled'}>‹ Prev</button><span>${pagination.page + 1} / ${pagination.totalPages}</span><button class=btn data-a=pg data-d=1 ${pagination.page + 1 >= pagination.totalPages ? 'disabled' : ''}>Next ›</button></div>` : `<div class=emp><b>No campaigns match these filters</b><p>No data to show for this view. Clear the filters or change the reporting period.</p><button class="btn p" data-a=clr>Clear filters</button></div>`}
 ${S.sel.length ? `<div class=bar role=region aria-label="Bulk actions for selected campaigns"><b>${S.sel.length} of ${pagination.total} campaign${pagination.total === 1 ? '' : 's'} selected</b><span class=sp></span><button class=btn data-a=bulkAddGroup>Add to group…</button><button class=btn data-a=bulkPause>Pause…</button><button class=btn data-a=bulkResume>Resume…</button><button class=btn data-a=exportCsv>Export selected</button><button class=btn data-a=clrSel>Clear selection</button></div>` : ''}</div>`;
 }
@@ -260,9 +573,12 @@ function overview() {
   const kpis = d.kpis;
   const stale = (dq.hasDelayedGoogle ? ' · ⏱ incl. delayed data' : '') + (dq.hasFailedSync ? ` · excl. ${dq.failedSyncCount} failed sync` : '') + (dq.isProvisional ? ' · provisional' : '');
 
+  const ots = G.ts.ov && !G.ts.ov.error ? G.ts.ov : null;
+  const sp = (m, col) => (ots ? spark(ots.total.current.map((p) => p[m]), col, ots.total.previous.map((p) => p[m])) : '');
   return `<div class=row><div><h1>Governance</h1><div class=sub>Your campaign performance, changes and priorities in one place.</div></div><span class=sp></span><span class=sub>Server-driven · Last synced: Nov 15, 08:40 · ${S.load ? '⟳ Refreshing…' : ''}</span><button class=btn data-a=refresh ${S.load ? 'disabled' : ''}>⟳ Refresh data</button></div>
 ${period()}${dq.hasDelayedGoogle ? `<div class=ban>⏱ <b>Google Ads connection delayed.</b> Meta data is current; ${dq.delayedGoogleCount} Google campaign(s) show last-synced values, so Google-attributed totals below may be incomplete.</div>` : ''}
-<div class=kp>${kpi('Total campaigns', '148', 'Campaigns in the ACME Cooling India account.', `${kpis.totalCampaigns} in sample`)}${kpi('Active campaigns', '126', 'Campaigns currently delivering.', `${kpis.activeCampaigns} in sample`)}${kpi('Total spend', inr(kpis.spend), 'Sum of spend across sample campaigns for the selected period.', `prev ${inr(kpis.prevSpend)}${stale}`, dl(kpis.spendChange, 0))}${kpi('Impressions', num(kpis.impressions), 'Times ads were shown.', `prev ${num(kpis.prevImpressions)}${stale}`, dl(kpis.impressionsChange, 1))}${kpi('Clicks', num(kpis.clicks), 'Clicks on ads.', `prev ${num(kpis.prevClicks)}${stale}`, dl(kpis.clicksChange, 1))}${kpi('Open issues', d.issues.length, 'Issues needing review (not dismissed or resolved). Alert rules are separate: see Alerts.', `${kpis.activeRulesCount} alert rules running`)}</div>
+<div class=kp>${kpi('Total campaigns', '148', 'Campaigns in the ACME Cooling India account.', `${kpis.totalCampaigns} in sample`)}${kpi('Active campaigns', '126', 'Campaigns currently delivering.', `${kpis.activeCampaigns} in sample`)}${kpi('Total spend', inr(kpis.spend), 'Sum of spend across sample campaigns for the selected period.', `prev ${inr(kpis.prevSpend)}${stale}`, dl(kpis.spendChange, 0), sp('spend', 'var(--pri)'))}${kpi('Impressions', num(kpis.impressions), 'Times ads were shown.', `prev ${num(kpis.prevImpressions)}${stale}`, dl(kpis.impressionsChange, 1), sp('impressions', '#16A5A5'))}${kpi('Clicks', num(kpis.clicks), 'Clicks on ads.', `prev ${num(kpis.prevClicks)}${stale}`, dl(kpis.clicksChange, 1), sp('clicks', '#D9902F'))}${kpi('Open issues', d.issues.length, 'Issues needing review (not dismissed or resolved). Alert rules are separate: see Alerts.', `${kpis.activeRulesCount} alert rules running`)}</div>
+<div class=row style="justify-content:flex-end;margin:-6px 0 10px"><span class=sub>Dashed line in each card = previous period.</span>${graphBtn('ov', 'View performance graph')}</div>${G.open.ov ? ovGraph() : ''}
 ${triage(d.issues)}${table()}`;
 }
 
@@ -286,8 +602,9 @@ function groupCard(g) {
   const open = !!S.openGroups[g.id];
   const c = g.combined;
   const lfl = c?.likeForLike;
-  return `<div class=card><div class=row><h2>${e(g.name)}</h2><span class=sub>${g.campaignCount} campaign${g.campaignCount === 1 ? '' : 's'} · updated ${e(g.updatedText)}</span><span class=sp></span><button class=btn data-a=toggleGroup data-id="${e(g.id)}" aria-expanded="${open}">${open ? 'Hide' : 'Open'}</button><button class=btn data-a=addToGroupModal data-id="${e(g.id)}">Add campaigns</button><button class="btn d" data-a=delGroup data-id="${e(g.id)}">Delete</button></div>
+  return `<div class=card><div class=row><h2>${e(g.name)}</h2><span class=sub>${g.campaignCount} campaign${g.campaignCount === 1 ? '' : 's'} · updated ${e(g.updatedText)}</span><span class=sp></span>${graphBtn('grp:' + g.id)}<button class=btn data-a=toggleGroup data-id="${e(g.id)}" aria-expanded="${open}">${open ? 'Hide' : 'Open'}</button><button class=btn data-a=addToGroupModal data-id="${e(g.id)}">Add campaigns</button><button class="btn d" data-a=delGroup data-id="${e(g.id)}">Delete</button></div>
 <div class=sub>${e(g.description)}</div>
+${G.open['grp:' + g.id] ? `<div style="margin-top:10px">${groupGraph(g)}</div>` : ''}
 ${c ? `<div class=tw style="margin-top:8px;max-height:none"><table><thead><tr><th></th><th class=r>Spend</th><th class=r>Impressions</th><th class=r>Clicks</th><th class=r>CTR</th><th class=r>CPC</th><th></th></tr></thead><tbody>
 ${combinedRow('Combined (current)', c.current, c.previous, null, 'All campaigns with usable data')}
 ${combinedRow('Combined (previous)', c.previous, null, null, '')}
@@ -316,7 +633,8 @@ function alerts() {
       : `<span class=sub>${e(t.status)}</span>`
   }${t.feedback ? '' : `<span class=sub style="white-space:nowrap">Was it right? <button class=btn data-a=fb data-id=${t.id} data-v=valid>Valid</button><button class=btn data-a=fb data-id=${t.id} data-v=misleading title="The data or rule made this alert misleading">Misleading</button><button class=btn data-a=fb data-id=${t.id} data-v=not_actionable>Not actionable</button></span>`}</div>`;
 
-  return `<div class=row><div><h1>Alerts</h1><div class=sub>You set the thresholds. One issue raises one alert: repeat triggers are deduplicated with a cooldown.</div></div><span class=sp></span><button class=btn data-a=evalAlerts>⟳ Run evaluation</button><button class="btn p" data-a=newAlert>+ New alert</button></div>
+  return `<div class=row><div><h1>Alerts</h1><div class=sub>You set the thresholds. One issue raises one alert: repeat triggers are deduplicated with a cooldown.</div></div><span class=sp></span>${graphBtn('alerts')}<button class=btn data-a=evalAlerts>⟳ Run evaluation</button><button class="btn p" data-a=newAlert>+ New alert</button></div>
+${G.open.alerts ? `<div style="margin-top:14px">${alertsGraph(d)}</div>` : ''}
 <div class=card style="margin-top:14px"><h2>Triggered alerts</h2><div style="margin-top:10px">${live.length ? live.map(trig).join('') : '<div class=emp>No triggered alerts need attention.</div>'}</div>${past.length ? `<details style="margin-top:8px"><summary class=sub>${past.length} earlier (dismissed or recovered)</summary><div style="margin-top:8px">${past.map(trig).join('')}</div></details>` : ''}</div>
 <div class=card><h2>Alert rules</h2>${
     d.rules.length
@@ -334,8 +652,8 @@ function alerts() {
 function activity() {
   const d = S.activityData;
   if (!d) return '<div class="card emp">Loading activity…</div>';
-  return `<div class=row><div><h1>Activity Log</h1><div class=sub>Every change a planner makes, in order.</div></div><span class=sp></span>${sel('S.activityType', S.activityType, [['', 'All types'], 'Campaign', 'Group', 'Alert', 'Selection', 'System'])}</div>
-<div class=card style="margin-top:14px">${d.items.length ? `<div class=tw style="max-height:none"><table><thead><tr><th>When</th><th>Who</th><th>Type</th><th>Action</th><th>Related</th></tr></thead><tbody>${d.items.map((a) => `<tr><td class=sub>${e(a.timestampText)}</td><td>${e(a.userName)}</td><td><span class="bd info">${e(a.type)}</span></td><td>${e(a.actionText)}</td><td class=sub>${e(a.relatedEntity)}</td></tr>`).join('')}</tbody></table></div>` : '<div class=emp>No activity yet.</div>'}</div>`;
+  return `<div class=row><div><h1>Activity Log</h1><div class=sub>Every change a planner makes, in order.</div></div><span class=sp></span>${graphBtn('act')}${sel('S.activityType', S.activityType, [['', 'All types'], 'Campaign', 'Group', 'Alert', 'Selection', 'System'])}</div>
+${G.open.act ? `<div style="margin-top:14px">${activityGraph(d)}</div>` : ''}<div class=card style="margin-top:14px">${d.items.length ? `<div class=tw style="max-height:none"><table><thead><tr><th>When</th><th>Who</th><th>Type</th><th>Action</th><th>Related</th></tr></thead><tbody>${d.items.map((a) => `<tr><td class=sub>${e(a.timestampText)}</td><td>${e(a.userName)}</td><td><span class="bd info">${e(a.type)}</span></td><td>${e(a.actionText)}</td><td class=sub>${e(a.relatedEntity)}</td></tr>`).join('')}</tbody></table></div>` : '<div class=emp>No activity yet.</div>'}</div>`;
 }
 
 // ---- Success metrics ------------------------------------------------------
@@ -351,8 +669,8 @@ function metrics() {
   const g = m.guardrail;
   const mw = m.manualWorkflow;
   const dec = m.decision;
-  return `<div class=row><div><h1>Success metrics</h1><div class=sub>Measured from product events · last ${m.window.days} days · proposed thresholds, not benchmarks.</div></div><span class=sp></span><button class=btn data-a=refresh>⟳ Refresh</button></div>
-<div class=card style="background:var(--navy);color:#fff;margin-top:14px"><div class=sub style="color:#8E9ABF">THE ONE NUMBER THAT MATTERS</div><div style="font-size:13px">${e(ns.name)}</div><div class=kv style="font-size:30px;margin:6px 0">${dur(ns.medianMinutes)}</div><div style="color:#C9D1E8">Median of detect-to-investigate (A) · ${ns.sampleSize} issue${ns.sampleSize === 1 ? '' : 's'} investigated</div>
+  return `<div class=row><div><h1>Success metrics</h1><div class=sub>Measured from product events · last ${m.window.days} days · proposed thresholds, not benchmarks.</div></div><span class=sp></span>${graphBtn('met')}<button class=btn data-a=refresh>⟳ Refresh</button></div>
+${G.open.met ? `<div style="margin-top:14px">${metricsGraph(m)}</div>` : ''}<div class=card style="background:var(--navy);color:#fff;margin-top:14px"><div class=sub style="color:#8E9ABF">THE ONE NUMBER THAT MATTERS</div><div style="font-size:13px">${e(ns.name)}</div><div class=kv style="font-size:30px;margin:6px 0">${dur(ns.medianMinutes)}</div><div style="color:#C9D1E8">Median of detect-to-investigate (A) · ${ns.sampleSize} issue${ns.sampleSize === 1 ? '' : 's'} investigated</div>
 <div class=row style="margin-top:10px"><div><span class=sub style="color:#8E9ABF">A · Detect → investigate (incl. notification delay)</span><div><b>${dur(ns.detectToInvestigateMedianMinutes)}</b></div></div><div><span class=sub style="color:#8E9ABF">B · Governance opened → issue opened (${ns.activeSessionSampleSize})</span><div><b>${dur(ns.activeSessionMedianMinutes)}</b></div></div></div></div>
 <div class=kp style="grid-template-columns:repeat(4,1fr)">${kpi('Weekly action rate', pctv(dr.weeklyGovernanceActionRate), 'Planners with ≥1 meaningful action ÷ weekly active planners', `${dr.weeklyActivePlanners} weekly active planner(s)`)}${kpi('Group adoption', pctv(dr.groupAdoptionRate), 'Planners who create AND revisit a group ÷ weekly active planners', '')}${kpi('Alert action rate', pctv(dr.alertActionRate), 'Eligible triggered alerts that led to opening the affected campaign', `${dr.eligibleTriggeredAlerts} eligible alert(s)`)}${kpi('Alert false-positive rate', pctv(g.alertFalsePositiveRate), 'Primary guardrail: misleading ÷ reviewed triggered alerts. Dismissals are not false positives.', `${g.misleadingAlerts} of ${g.reviewedTriggeredAlerts} reviewed`)}</div>
 <div class=card><h2>Diagnostics</h2><div class=sub style="margin-top:6px">Alert dismissal rate: <b>${pctv(g.alertDismissalRate)}</b> (a dismissed alert is not automatically a false positive) · CSV exports this window: <b>${mw.exportClicks}</b> (${mw.exportsPerWeek}/week)</div></div>
@@ -394,6 +712,7 @@ function drillBody() {
   return `<div class=sub>${pl(c.platform)} · ${e(c.objective)} · ${stb(c.status)} · <span title="${e(c.reliability.reasonText)}">${c.reliability.isReliable ? '✓ Complete data' : e(c.reliability.flagText)}</span></div>
 <div class=sub>${e(c.raw)}</div>
 ${!c.reliability.isReliable ? `<div class=ban style="margin-top:8px">${e(c.reliability.reasonText)}</div>` : ''}
+<div class=row style="margin-top:10px">${graphBtn('drill', 'View graph')}</div>${G.open.drill ? drillGraph() : ''}
 ${issues.length ? `<div style="margin-top:10px">${issues.map((i) => `<div class="iss ${i.severity}" style="padding:7px 10px"><span class="bd ${sevc(i.severity)}">${i.severity}</span><div class=sp><b>${e(i.metric)}: ${e(i.changeDisplay)}</b> <span class=sub>· detected ${e(i.detectedAt)}</span><div class=sub>${e(i.whyText)}</div></div>${i.state === 'open' || i.state === 'reviewed' ? `<button class="btn p" data-a=resolveIssue data-id="${e(i.id)}">Mark resolved</button>` : ''}</div>`).join('')}</div>` : ''}
 <h2 style="margin-top:14px">Ad sets <span class=sub>(drilldown stops here; deeper analysis stays in the ad platforms)</span></h2>
 ${total === 0 ? `<div class=emp><b>${NO_ADSETS}</b><p>It is excluded from comparisons and ad-set-level alerts.</p></div>` : `<div class=row style="margin:8px 0"><label><input type=checkbox data-a=ddAll aria-label="Select all ad sets in this campaign" ${picked === total ? 'checked' : ''} ${picked > 0 && picked < total ? 'data-ind=1' : ''}> <b>${e(c.name)}</b></label><span class=sub aria-live=polite>${picked} of ${total} ad sets selected</span></div>
@@ -572,6 +891,8 @@ function ask(cfg) {
 
 async function openDrill(id, source) {
   S.modal = { type: 'drill', id, data: null, sel: [] };
+  G.open.drill = false;
+  delete G.ts.drill;
   renderModals();
   api.track('campaign_opened', { campaignId: Number(id), source });
   try {
@@ -667,6 +988,23 @@ const alertPayload = (f) => ({ name: f.name, entityType: f.entityType, entityIds
 
 const A = {
   none: () => {},
+  graph: async (d) => {
+    const k = d.k;
+    G.open[k] = !G.open[k];
+    rerenderAll();
+    if (!G.open[k]) return;
+    if (k === 'tbl') await loadTs('sel');
+    else await loadTs(k);
+    rerenderAll();
+  },
+  gmetric: (d) => {
+    G.metric = d.v;
+    rerenderAll();
+  },
+  tmetric: (d) => {
+    G.tblMetric = d.v;
+    render();
+  },
   nav: (d) => {
     S.pg = d.pg;
     S.sel = S.pg === 'overview' || S.pg === 'campaigns' ? S.sel : [];
@@ -729,6 +1067,7 @@ const A = {
     const i = +d.id;
     S.sel = S.sel.includes(i) ? S.sel.filter((x) => x !== i) : [...S.sel, i];
     render();
+    schedSelGraph();
   },
   selAll: () => {
     if (!S.campaignsData) return;
@@ -739,10 +1078,12 @@ const A = {
       S.sel = [...new Set([...S.sel, ...ids])];
     }
     render();
+    schedSelGraph();
   },
   clrSel: () => {
     S.sel = [];
     render();
+    schedSelGraph();
   },
   attTab: () => {
     T.tab = 'att';
@@ -754,6 +1095,7 @@ const A = {
     render();
   },
   refresh: async () => {
+    G.ts = {};
     if (S.pg === 'overview') await guarded(() => api.evaluateAlerts());
     await loadData({ evaluate: S.pg === 'alerts' });
     toast('Data refreshed from backend.');
@@ -1093,6 +1435,8 @@ document.addEventListener('change', async (ev) => {
     loadData();
   }
 });
+
+initChartHover();
 
 // Initial boot: governance_opened starts the session (the "B" clock), then the alert engine runs.
 api.track('governance_opened', { source: 'overview' });

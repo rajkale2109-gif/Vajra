@@ -157,6 +157,13 @@ export interface SuccessMetrics {
     manualWorkflowReduction: DecisionItem;
     overall: 'continue' | 'investigate' | 'insufficient_data';
   };
+  /** Proposed thresholds, exposed so charts can draw the target line next to the measured value. */
+  thresholds: {
+    falsePositiveRateLimit: number;
+    alertActionRateFloor: number;
+    workflowAdoptionFloor: number;
+    exportReductionTarget: number;
+  };
   methodology: string;
 }
 
@@ -352,6 +359,12 @@ export async function computeSuccessMetrics(
       reductionPct: round1(reduction),
     },
     decision: { alertQuality, workflowAdoption, manualWorkflowReduction, overall },
+    thresholds: {
+      falsePositiveRateLimit: config.FALSE_POSITIVE_RATE_LIMIT,
+      alertActionRateFloor: config.ALERT_ACTION_RATE_FLOOR,
+      workflowAdoptionFloor: config.WORKFLOW_ADOPTION_FLOOR,
+      exportReductionTarget: config.EXPORT_REDUCTION_TARGET,
+    },
     methodology:
       'Proposed product metrics. Thresholds are initial proposals, not industry benchmarks; baselines must be established before launch and targets validated with pilot data. Alert dismissal is a diagnostic, not a false-positive measure: false positives require reviewing the underlying data and rule.',
   };
