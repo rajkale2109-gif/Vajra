@@ -1,6 +1,7 @@
 import { getDb } from './connection.js';
 import * as schema from './schema.js';
 import { generateSampleData, RawCampaignDef, RawAdSetDef } from './seed-data.js';
+import { backfillIssueDetected } from '../services/eventsService.js';
 
 export async function seedDatabase(databaseUrl?: string) {
   const { db, raw } = await getDb(databaseUrl);
@@ -624,6 +625,8 @@ export async function seedDatabase(databaseUrl?: string) {
   for (const iss of initialIssues) {
     await db.insert(schema.issues).values(iss);
   }
+  // Detection happened before the planner opened Governance: record it so detect-to-investigate is measurable.
+  await backfillIssueDetected(accountId, userId, initialIssues);
 
   // 10. Seed Activity Log
   const initialLogs = [

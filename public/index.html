@@ -30,6 +30,7 @@
   #toast{position:fixed;bottom:18px;right:18px;z-index:40;display:grid;gap:6px}#toast div{background:var(--navy);color:#fff;padding:9px 14px;border-radius:6px;border-left:4px solid var(--ok)}
   .emp{text-align:center;padding:36px;color:var(--tx2)}.ban{padding:8px 12px;border-radius:6px;background:#D9902518;border:1px solid var(--warn);margin-bottom:12px}.pl{font-weight:600}.pl.Meta{color:#2F6FE0}.pl.Google{color:#D9502F}
   .kp.k5{grid-template-columns:repeat(5,1fr)}
+  .fl label{font-weight:600;font-size:12px}details summary{cursor:pointer}.iss.High .sp{min-width:0}.md h2{font-size:16px}
   @media(max-width:1100px){.kp,.kp.k5{grid-template-columns:repeat(3,1fr)}#app{padding-left:60px}aside{position:fixed;left:0;top:0;z-index:15}aside:not(.c){box-shadow:4px 0 24px #0005}.gd{position:fixed;right:0;top:0;z-index:18;box-shadow:-4px 0 24px #0004;max-width:92vw}}@media(max-width:700px){.kp,.kp.k5{grid-template-columns:repeat(2,1fr)}main{padding:12px}}
   .s2{font-size:11px;line-height:1.25;color:var(--tx2);margin-top:1px;font-weight:400}.bar{flex-wrap:wrap}
   .sr{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}.sk:focus{left:8px;top:8px;width:auto;height:auto;background:var(--card);padding:8px 12px;z-index:50;border-radius:6px}
@@ -42,6 +43,8 @@
 <body>
   <a class="sr sk" href="#main">Skip to main content</a>
   <div id="app"></div>
+  <div id="modal"></div>
+  <div id="modal2"></div>
   <div id="toast" role="status" aria-live="polite"></div>
   <script type="module" src="/app.js"></script>
 </body>

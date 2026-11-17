@@ -141,8 +141,18 @@ CREATE TABLE IF NOT EXISTS alert_triggers (
   period_previous_end TEXT NOT NULL,
   excluded_count INTEGER NOT NULL DEFAULT 0,
   feedback TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  provisional BOOLEAN NOT NULL DEFAULT FALSE,
+  entity_label TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT '',
+  triggered_at TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
+ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS provisional BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS entity_label TEXT NOT NULL DEFAULT '';
+ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS message TEXT NOT NULL DEFAULT '';
+ALTER TABLE alert_triggers ADD COLUMN IF NOT EXISTS triggered_at TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS issues (
   id TEXT PRIMARY KEY,
@@ -186,11 +196,13 @@ CREATE TABLE IF NOT EXISTS analytics_events (
   issue_id TEXT,
   objective TEXT,
   platform TEXT,
+  severity TEXT,
   data_state TEXT,
   selected_count INTEGER,
   payload TEXT,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS severity TEXT;
 
 CREATE TABLE IF NOT EXISTS settings (
   id TEXT PRIMARY KEY,

@@ -1,16 +1,17 @@
-import { api } from './api.js';
+import { api, setSession } from './api.js';
 
 const $ = (s) => document.querySelector(s);
-const e = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const e = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const num = (n) => (n == null ? 'N/A' : Math.round(n).toLocaleString('en-IN'));
 const inr = (n) => (n == null ? 'N/A' : '₹' + Math.round(n).toLocaleString('en-IN'));
 const inr2 = (n) => (n == null ? 'N/A' : '₹' + n.toFixed(2));
 const pcf = (n) => (n == null ? 'N/A' : n.toFixed(2) + '%');
 const pp = (x) => (x > 0 ? '+' : x < 0 ? '−' : '') + Math.abs(x).toFixed(2);
 const sg = (v) => (v == null ? 'N/A' : (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(1) + '%');
+// A missing / zero baseline never renders as 0% or infinity: say "No baseline" next to the absolute value.
 const dl = (v, g) =>
   v == null
-    ? '<span class=n title="Previous value is zero or missing, so % change is undefined (not shown as 0 or infinity)">N/A</span>'
+    ? '<span class=n title="Previous-period value is zero or missing, so % change is undefined (not shown as 0 or infinity)">No baseline</span>'
     : `<span class="${!g || Math.abs(v) < 0.05 ? 'n' : v * g > 0 ? 'ok' : 'bad'}">${v > 0 ? '▲' : v < 0 ? '▼' : '■'} ${sg(v)}</span>`;
 
 const ppd = (ctrChange) => {
@@ -44,9 +45,10 @@ const stb = (s) =>
   }[s] || s);
 
 const sevc = (k) => (k === 'High' ? 'bad' : k === 'Info' ? 'info' : 'warn');
+const NO_ADSETS = 'No ad sets configured yet — metrics unavailable.';
 
 const kpi = (t, v, tip, sub, d) =>
-  `<div class=card title="${tip}"><div class=sub>${t} ⓘ</div><div class=kv>${v}</div><div>${d || ''} <span class=sub>${sub || ''}</span></div></div>`;
+  `<div class=card title="${e(tip)}"><div class=sub>${t} ⓘ</div><div class=kv>${v}</div><div>${d || ''} <span class=sub>${sub || ''}</span></div></div>`;
 
 const sel = (set, v, opts, id) =>
   `<select data-set="${set}" ${id ? 'id=' + id : ''}>${opts
@@ -58,7 +60,7 @@ const sel = (set, v, opts, id) =>
 
 const s2 = (c, pv, f, ch) => {
   if (c.reliability.reasonCode === 'd') {
-    return `<div class=s2 title="Partial data: values may be incomplete">⏱ Delayed · synced ${c.lastSync}</div>`;
+    return `<div class=s2 title="Partial data: values may be incomplete">⏱ Delayed · synced ${e(c.lastSync)}</div>`;
   }
   if (!pv) {
     return '<div class=s2>No baseline</div>';
@@ -68,10 +70,22 @@ const s2 = (c, pv, f, ch) => {
 
 const flag = (c) => {
   const rel = c.reliability;
-  return `<span class=w title="${e(rel.reasonText)}">${rel.flagText}</span>`;
+  const text = rel.reasonCode === 'l' ? '⚠ Insufficient data' : rel.flagText;
+  return `<span class=w title="${e(rel.reasonText)}">${text}</span>`;
 };
 
-// Global state
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const SID = (() => {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return 's_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+})();
+setSession(SID);
+
 const S = {
   pg: 'overview',
   cs: '2026-11-08',
@@ -84,9 +98,18 @@ const S = {
   load: false,
   overviewData: null,
   campaignsData: null,
+  groupsData: null,
+  alertsData: null,
+  activityData: null,
+  metricsData: null,
+  exportBaseline: '',
+  openGroups: {},
+  activityType: '',
   issAll: false,
-  dd: null,
-  toast: null,
+  modal: null, // { type: 'drill' | 'group' | 'addGroup' | 'alert' ...}
+  confirm: null, // { title, lines[], run }
+  openedAt: Date.now(),
+  surfaced: new Set(),
 };
 
 const T = {
@@ -103,6 +126,8 @@ const T = {
   cm: false,
   hid: ['pSpend', 'pCtr', 'pCpc', 'dS', 'dCtr', 'dCpc'],
 };
+
+const dateParams = () => ({ current_start: S.cs, current_end: S.ce, previous_start: S.ps, previous_end: S.pe });
 
 const COLS = [
   ['spend', 'Spend', (c) => c.current.spend, (c) => inr(c.current.spend), (c) => s2(c, c.previous.spend, inr, dl(c.changes.spend.relativePct, 0))],
@@ -123,41 +148,31 @@ const toast = (m, w) => {
   d.textContent = m;
   if (w) d.style.borderLeftColor = '#D99025';
   $('#toast').append(d);
-  setTimeout(() => d.remove(), 3000);
+  setTimeout(() => d.remove(), 4000);
 };
 
-// Data loading functions
-async function loadData() {
+const unavailable = (r) => r.reliability.reasonCode === 'f' || r.reliability.reasonCode === 'n';
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+async function loadData(opts = {}) {
   S.load = true;
   render();
 
   try {
-    const dateParams = {
-      current_start: S.cs,
-      current_end: S.ce,
-      previous_start: S.ps,
-      previous_end: S.pe,
-    };
-
-    if (S.pg === 'overview') {
-      S.overviewData = await api.getOverview(dateParams);
-    }
+    if (S.pg === 'overview') S.overviewData = await api.getOverview(dateParams());
 
     if (S.pg === 'overview' || S.pg === 'campaigns') {
-      S.campaignsData = await api.getCampaigns({
-        ...dateParams,
-        q: T.q,
-        plat: T.plat,
-        obj: T.obj,
-        st: T.st,
-        perf: T.perf,
-        tab: T.tab,
-        sort: T.sort,
-        dir: T.dir,
-        page: T.page,
-        size: T.size,
-      });
+      S.campaignsData = await api.getCampaigns({ ...dateParams(), q: T.q, plat: T.plat, obj: T.obj, st: T.st, perf: T.perf, tab: T.tab, sort: T.sort, dir: T.dir, page: T.page, size: T.size });
     }
+    if (S.pg === 'groups') S.groupsData = await api.getGroups(dateParams());
+    if (S.pg === 'alerts') {
+      if (opts.evaluate) await api.evaluateAlerts();
+      S.alertsData = await api.getAlerts();
+    }
+    if (S.pg === 'activity') S.activityData = await api.getActivity(S.activityType);
+    if (S.pg === 'metrics') S.metricsData = await api.getSuccessMetrics({ days: 7, export_baseline: S.exportBaseline });
   } catch (err) {
     toast(`Error loading data: ${err.message}`, 1);
   } finally {
@@ -166,7 +181,20 @@ async function loadData() {
   }
 }
 
+async function guarded(fn, okMsg) {
+  try {
+    const r = await fn();
+    if (okMsg) toast(okMsg);
+    return r;
+  } catch (err) {
+    toast(err.message, 1);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Components
+// ---------------------------------------------------------------------------
 function period() {
   const cur = [S.cs, S.ce, S.ps, S.pe].join();
   const act = Object.keys(PRE).find((k) => PRE[k].join() === cur) || 'c';
@@ -178,7 +206,7 @@ function period() {
 
   return `<div class=card style="padding:10px 14px"><div class=row><b>Compare</b><span class=seg>${bt('t', 'Today vs yesterday')}${bt('7', 'Last 7 days vs previous 7')}${bt('30', 'Last 30 days vs previous 30')}${bt('c', 'Custom')}</span><span class=sp></span><label class=sub><input type=checkbox data-a=autoP ${S.auto ? 'checked' : ''}> Auto-set previous period</label></div>
 <div class=row style="margin-top:8px"><span class=sub>Current</span><input type=date id=d1 data-set=S.cs value="${S.cs}" aria-label="Current period start">–<input type=date id=d2 data-set=S.ce value="${S.ce}" aria-label="Current period end">${pd(dc)}<span class=sub>vs previous</span><input type=date id=d3 data-set=S.ps value="${S.ps}" aria-label="Previous period start">–<input type=date id=d4 data-set=S.pe value="${S.pe}" aria-label="Previous period end">${pd(dp)}<span class=sp></span><span class=sub>Data calculated on server from real daily metrics rows.</span></div>
-${isProv ? '<div class=ban style="margin:8px 0 0">⚠ <b>Provisional data:</b> the current period includes today (data through 09:00). Totals are partial and comparisons may overstate declines. Alerts are not evaluated on provisional data.</div>' : ''}${dc !== dp ? `<div class=ban style="margin:8px 0 0">⚠ The periods differ in length (${dc} vs ${dp} days). Spend, impressions and clicks changes partly reflect that difference; CTR and CPC are unaffected.</div>` : ''}</div>`;
+${isProv ? '<div class=ban style="margin:8px 0 0">⚠ <b>Provisional data:</b> the current period includes today (data through 09:00). Totals are partial and comparisons may overstate declines. Any alert evaluated on this data is marked <b>provisional</b> and is not treated as final.</div>' : ''}${dc !== dp ? `<div class=ban style="margin:8px 0 0">⚠ The periods differ in length (${dc} vs ${dp} days). Spend, impressions and clicks changes partly reflect that difference; CTR and CPC are unaffected.</div>` : ''}</div>`;
 }
 
 function triage(is) {
@@ -187,7 +215,22 @@ function triage(is) {
   is.forEach((i) => n[i.severity]++);
   const sh = S.issAll ? is : is.slice(0, 4);
 
-  return `<div class=card><div class=row><h2>Needs your attention</h2>${['High', 'Medium', 'Info'].map((k) => (n[k] ? `<span class="bd ${sevc(k)}">${n[k]} ${k}</span>` : '')).join('')}<span class=sub>${is.length} open · most severe first</span><span class=sp></span>${is.length ? '<button class=btn data-a=attTab>Show these in table ↓</button>' : ''}</div><div style="margin-top:10px">${is.length ? sh.map((i) => `<div class="iss ${i.severity}" style="padding:7px 10px"><span class="bd ${sevc(i.severity)}">${i.severity}</span><div class=sp><b>${e(i.campaignName)}</b> ${pl(i.platform)} · ${i.metric}: <b>${i.changeDisplay}</b> <span class=sub>· detected ${i.detectedAt}</span><div class=sub>${e(i.whyText)}</div></div><button class="btn p" data-a=openCamp data-id=${i.campaignId}>View campaign</button><button class=btn data-a=revIssue data-id=${i.id}>Mark reviewed</button><button class=btn data-a=disIssue data-id=${i.id}>Dismiss</button></div>`).join('') : '<div class=emp>All caught up — no open issues.</div>'}${is.length > 4 ? `<button class=btn data-a=issAll>${S.issAll ? 'Show top 4 only' : `Show all ${is.length} issues`}</button>` : ''}</div></div>`;
+  // issue_surfaced: Governance displayed this issue to the planner (once per issue per session)
+  for (const i of sh) {
+    if (!S.surfaced.has(i.id)) {
+      S.surfaced.add(i.id);
+      api.track('issue_surfaced', { issueId: i.id, campaignId: i.campaignId, severity: i.severity, platform: i.platform, source: 'triage' });
+    }
+  }
+
+  return `<div class=card><div class=row><h2>Needs your attention</h2>${['High', 'Medium', 'Info'].map((k) => (n[k] ? `<span class="bd ${sevc(k)}">${n[k]} ${k}</span>` : '')).join('')}<span class=sub>${is.length} open · most severe first</span><span class=sp></span>${is.length ? '<button class=btn data-a=attTab>Show these in table ↓</button>' : ''}</div><div style="margin-top:10px">${is.length ? sh.map((i) => `<div class="iss ${i.severity}" style="padding:7px 10px"><span class="bd ${sevc(i.severity)}">${i.severity}</span><div class=sp><b>${e(i.campaignName)}</b> ${pl(i.platform)} · ${e(i.metric)}: <b>${e(i.changeDisplay)}</b> <span class=sub>· detected ${e(i.detectedAt)}</span><div class=sub>${e(i.whyText)}</div></div><button class="btn p" data-a=openIssue data-id="${e(i.id)}" data-cid="${i.campaignId}">View campaign</button><button class=btn data-a=revIssue data-id="${e(i.id)}">Mark reviewed</button><button class=btn data-a=disIssue data-id="${e(i.id)}">Dismiss</button></div>`).join('') : '<div class=emp>All caught up — no open issues.</div>'}${is.length > 4 ? `<button class=btn data-a=issAll>${S.issAll ? 'Show top 4 only' : `Show all ${is.length} issues`}</button>` : ''}</div></div>`;
+}
+
+function nameCellNote(r) {
+  const code = r.reliability.reasonCode;
+  if (code === 'n') return `<div class="s2 w">${NO_ADSETS}</div>`;
+  if (code === 'f') return '<div class="s2 w">✖ Sync failed — data unavailable (not shown as zero)</div>';
+  return '';
 }
 
 function table() {
@@ -198,14 +241,15 @@ function table() {
   const { items, pagination, tabCounts } = S.campaignsData;
   const cols = COLS.filter((c) => !T.hid.includes(c[0]));
   const allSel = items.length && items.every((r) => S.sel.includes(r.campaignId));
+  const someSel = items.some((r) => S.sel.includes(r.campaignId));
 
   const tabBtn = (k, l, count) => `<button class="${T.tab === k ? 'a' : ''}" data-a=tab data-v=${k}>${l} <span class=sub>${count}</span></button>`;
 
   return `<div class=card id=tbl><div class=tabs role=tablist>${tabBtn('all', 'All campaigns', tabCounts.all)}${tabBtn('att', 'Needs attention', tabCounts.att)}${tabBtn('imp', 'Improving', tabCounts.imp)}${tabBtn('dec', 'Declining', tabCounts.dec)}${tabBtn('Paused', 'Paused', tabCounts.Paused)}${tabBtn('Ended', 'Ended', tabCounts.Ended)}</div>
-<div class=row style="margin-bottom:10px"><input id=sq data-set=T.q value="${e(T.q)}" placeholder="Search campaign name…" aria-label="Search campaigns" style="width:220px">${sel('T.plat', T.plat, [['', 'All platforms'], 'Meta', 'Google'])}${sel('T.obj', T.obj, [['', 'All objectives'], 'Awareness', 'Traffic', 'Engagement', 'Leads', 'Sales', 'App Promotion'])}${sel('T.st', T.st, [['', 'All statuses'], 'Active', 'Learning', 'Paused', 'Ended'])}${sel('T.perf', T.perf, [['', 'Any performance'], ['imp', 'Improving CTR'], ['dec', 'Declining CTR']])}<button class=btn data-a=clr>Clear filters</button><span class=sp></span><div style="position:relative" data-dd><button class=btn data-a=cm>Columns ▾</button>${T.cm ? `<div class=dd style="width:200px">${COLS.map((c) => `<label style="display:flex;gap:8px;padding:4px"><input type=checkbox data-a=colv data-k=${c[0]} ${T.hid.includes(c[0]) ? '' : 'checked'}>${c[1]}</label>`).join('')}</div>` : ''}</div></div>
-${items.length ? `<div class="tw cs"><table><caption class=sr>Campaign performance, current vs previous period</caption><thead><tr><th><input type=checkbox aria-label="Select all visible" data-a=selAll ${allSel ? 'checked' : ''}></th><th scope=col aria-sort="${T.sort === 'name' ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=name>Campaign ${T.sort === 'name' ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th><th>Platform</th><th>Objective</th><th>Status</th>${cols.map((c) => `<th scope=col class=r aria-sort="${T.sort === c[0] ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=${c[0]}>${c[1]} ${T.sort === c[0] ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th>`).join('')}<th>Updated</th></tr></thead><tbody>${items.map((r) => `<tr class="${S.sel.includes(r.campaignId) ? 'sl' : ''}"><td><input type=checkbox aria-label="Select ${e(r.name)}" data-a=sel data-id=${r.campaignId} ${S.sel.includes(r.campaignId) ? 'checked' : ''}></td><td><button class=lnk data-a=openCamp data-id=${r.campaignId}>${e(r.name)}</button><div class=raw title="${e(r.raw)}">${e(r.raw)}</div>${(r.issues || []).map((i) => `<span class="bd ${sevc(i.severity)}" title="${e(i.whyText)}">⚑ ${i.metric} ${i.changeDisplay}</span>`).join(' ')}</td><td>${pl(r.platform)}</td><td>${r.objective}</td><td>${stb(r.status)}</td>${cols.map((c) => `<td class=r>${r.reliability.reasonCode === 'f' || r.reliability.reasonCode === 'n' ? '<span class=n title="Metrics unavailable">—</span>' : c[3](r) + (c[4] ? c[4](r) : '')}</td>`).join('')}<td class=sub>${r.reliability.reasonCode === 'd' ? '<span class=w>⏱ ' : '<span>'}${r.lastSync}</span></td></tr>`).join('')}</tbody></table></div>
+<div class=row style="margin-bottom:10px"><input id=sq data-set=T.q value="${e(T.q)}" placeholder="Search campaign name…" aria-label="Search campaigns" style="width:220px">${sel('T.plat', T.plat, [['', 'All platforms'], 'Meta', 'Google'])}${sel('T.obj', T.obj, [['', 'All objectives'], 'Awareness', 'Traffic', 'Engagement', 'Leads', 'Sales', 'App Promotion'])}${sel('T.st', T.st, [['', 'All statuses'], 'Active', 'Learning', 'Paused', 'Ended'])}${sel('T.perf', T.perf, [['', 'Any performance'], ['imp', 'Improving CTR'], ['dec', 'Declining CTR']])}<button class=btn data-a=clr>Clear filters</button><span class=sp></span><button class=btn data-a=exportCsv title="Download the current view (or your selection) as CSV">⇩ Export CSV</button><div style="position:relative" data-dd><button class=btn data-a=cm>Columns ▾</button>${T.cm ? `<div class=dd style="width:200px">${COLS.map((c) => `<label style="display:flex;gap:8px;padding:4px"><input type=checkbox data-a=colv data-k=${c[0]} ${T.hid.includes(c[0]) ? '' : 'checked'}>${c[1]}</label>`).join('')}</div>` : ''}</div></div>
+${items.length ? `<div class="tw cs"><table><caption class=sr>Campaign performance, current vs previous period</caption><thead><tr><th><input type=checkbox aria-label="Select all visible" data-a=selAll ${allSel ? 'checked' : ''} ${!allSel && someSel ? 'data-ind=1' : ''}></th><th scope=col aria-sort="${T.sort === 'name' ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=name>Campaign ${T.sort === 'name' ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th><th>Platform</th><th>Objective</th><th>Status</th>${cols.map((c) => `<th scope=col class=r aria-sort="${T.sort === c[0] ? (T.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button data-a=sort data-k=${c[0]}>${c[1]} ${T.sort === c[0] ? (T.dir > 0 ? '▲' : '▼') : ''}</button></th>`).join('')}<th>Updated</th></tr></thead><tbody>${items.map((r) => `<tr class="${S.sel.includes(r.campaignId) ? 'sl' : ''}"><td><input type=checkbox aria-label="Select ${e(r.name)}" data-a=sel data-id=${r.campaignId} ${S.sel.includes(r.campaignId) ? 'checked' : ''}></td><td><button class=lnk data-a=openCamp data-id=${r.campaignId}>${e(r.name)}</button><div class=raw title="${e(r.raw)}">${e(r.raw)}</div>${nameCellNote(r)}${(r.issues || []).map((i) => `<span class="bd ${sevc(i.severity)}" title="${e(i.whyText)}">⚑ ${e(i.metric)} ${e(i.changeDisplay)}</span>`).join(' ')}</td><td>${pl(r.platform)}</td><td>${e(r.objective)}</td><td>${stb(r.status)}</td>${cols.map((c) => `<td class=r>${unavailable(r) ? '<span class=n title="Metrics unavailable">—</span>' : c[3](r) + (c[4] ? c[4](r) : '')}</td>`).join('')}<td class=sub>${r.reliability.reasonCode === 'd' ? '<span class=w>⏱ ' : '<span>'}${e(r.lastSync)}</span></td></tr>`).join('')}</tbody></table></div>
 <div class=row style="margin-top:8px"><span class=sub>${pagination.total} campaigns · ${S.sel.length} selected</span><span class=sp></span>Rows ${sel('T.size', T.size, [10, 25, 50])}<button class=btn data-a=pg data-d=-1 ${pagination.page ? '' : 'disabled'}>‹ Prev</button><span>${pagination.page + 1} / ${pagination.totalPages}</span><button class=btn data-a=pg data-d=1 ${pagination.page + 1 >= pagination.totalPages ? 'disabled' : ''}>Next ›</button></div>` : `<div class=emp><b>No campaigns match these filters</b><p>No data to show for this view. Clear the filters or change the reporting period.</p><button class="btn p" data-a=clr>Clear filters</button></div>`}
-${S.sel.length ? `<div class=bar role=region aria-label="Bulk actions for selected campaigns"><b>${S.sel.length} campaign${S.sel.length > 1 ? 's' : ''} selected</b><span class=sp></span><button class=btn data-a=clrSel>Clear selection</button></div>` : ''}</div>`;
+${S.sel.length ? `<div class=bar role=region aria-label="Bulk actions for selected campaigns"><b>${S.sel.length} of ${pagination.total} campaign${pagination.total === 1 ? '' : 's'} selected</b><span class=sp></span><button class=btn data-a=bulkAddGroup>Add to group…</button><button class=btn data-a=bulkPause>Pause…</button><button class=btn data-a=bulkResume>Resume…</button><button class=btn data-a=exportCsv>Export selected</button><button class=btn data-a=clrSel>Clear selection</button></div>` : ''}</div>`;
 }
 
 function overview() {
@@ -214,16 +258,251 @@ function overview() {
 
   const dq = d.dataQuality;
   const kpis = d.kpis;
-  const stale = (dq.hasDelayedGoogle ? ' · ⏱ incl. delayed data' : '') + (dq.hasFailedSync ? ' · excl. 1 failed sync' : '') + (dq.isProvisional ? ' · provisional' : '');
+  const stale = (dq.hasDelayedGoogle ? ' · ⏱ incl. delayed data' : '') + (dq.hasFailedSync ? ` · excl. ${dq.failedSyncCount} failed sync` : '') + (dq.isProvisional ? ' · provisional' : '');
 
   return `<div class=row><div><h1>Governance</h1><div class=sub>Your campaign performance, changes and priorities in one place.</div></div><span class=sp></span><span class=sub>Server-driven · Last synced: Nov 15, 08:40 · ${S.load ? '⟳ Refreshing…' : ''}</span><button class=btn data-a=refresh ${S.load ? 'disabled' : ''}>⟳ Refresh data</button></div>
 ${period()}${dq.hasDelayedGoogle ? `<div class=ban>⏱ <b>Google Ads connection delayed.</b> Meta data is current; ${dq.delayedGoogleCount} Google campaign(s) show last-synced values, so Google-attributed totals below may be incomplete.</div>` : ''}
-<div class=kp>${kpi('Total campaigns', '148', 'Campaigns in the ACME Cooling India account.', `${kpis.totalCampaigns} in sample`)}${kpi('Active campaigns', '126', 'Campaigns currently delivering.', `${kpis.activeCampaigns} in sample`)}${kpi('Total spend', inr(kpis.spend), 'Sum of spend across sample campaigns for the selected period.', `prev ${inr(kpis.prevSpend)}${stale}`, dl(kpis.spendChange, 0))}${kpi('Impressions', num(kpis.impressions), 'Times ads were shown.', `prev ${num(kpis.prevImpressions)}${stale}`, dl(kpis.impressionsChange, 1))}${kpi('Clicks', num(kpis.clicks), 'Clicks on ads.', `prev ${num(kpis.prevClicks)}${stale}`, dl(kpis.clicksChange, 1))}${kpi('Active alerts', d.issues.length, 'Open issues needing review (not dismissed).', `${kpis.activeRulesCount} rules running`)}</div>
+<div class=kp>${kpi('Total campaigns', '148', 'Campaigns in the ACME Cooling India account.', `${kpis.totalCampaigns} in sample`)}${kpi('Active campaigns', '126', 'Campaigns currently delivering.', `${kpis.activeCampaigns} in sample`)}${kpi('Total spend', inr(kpis.spend), 'Sum of spend across sample campaigns for the selected period.', `prev ${inr(kpis.prevSpend)}${stale}`, dl(kpis.spendChange, 0))}${kpi('Impressions', num(kpis.impressions), 'Times ads were shown.', `prev ${num(kpis.prevImpressions)}${stale}`, dl(kpis.impressionsChange, 1))}${kpi('Clicks', num(kpis.clicks), 'Clicks on ads.', `prev ${num(kpis.prevClicks)}${stale}`, dl(kpis.clicksChange, 1))}${kpi('Open issues', d.issues.length, 'Issues needing review (not dismissed or resolved). Alert rules are separate: see Alerts.', `${kpis.activeRulesCount} alert rules running`)}</div>
 ${triage(d.issues)}${table()}`;
 }
 
 function campaigns() {
   return `<h1>Campaigns</h1><div class=sub style="margin-bottom:12px">All campaigns across Meta and Google.</div>${period()}${table()}`;
+}
+
+// ---- Groups ---------------------------------------------------------------
+function combinedRow(label, cur, prev, chg, note) {
+  return `<tr><td>${label}</td><td class=r>${inr(cur.spend)}</td><td class=r>${num(cur.impressions)}</td><td class=r>${num(cur.clicks)}</td><td class=r>${pcf(cur.ctr)} ${chg ? ppd(chg.ctr) : ''}</td><td class=r>${inr2(cur.cpc)} ${chg ? dl(chg.cpc.relativePct, -1) : ''}</td><td class=sub>${note || ''}</td></tr>`;
+}
+
+function groups() {
+  const d = S.groupsData;
+  if (!d) return '<div class="card emp">Loading groups…</div>';
+  return `<div class=row><div><h1>Groups</h1><div class=sub>Related campaigns judged together. % change uses like-for-like campaigns only (reliable in both periods).</div></div><span class=sp></span><button class="btn p" data-a=newGroup>+ New group</button></div>${period()}
+${d.groups.length ? d.groups.map((g) => groupCard(g)).join('') : '<div class="card emp"><b>No groups yet</b><p>Create a group to see related campaigns\' combined performance.</p></div>'}`;
+}
+
+function groupCard(g) {
+  const open = !!S.openGroups[g.id];
+  const c = g.combined;
+  const lfl = c?.likeForLike;
+  return `<div class=card><div class=row><h2>${e(g.name)}</h2><span class=sub>${g.campaignCount} campaign${g.campaignCount === 1 ? '' : 's'} · updated ${e(g.updatedText)}</span><span class=sp></span><button class=btn data-a=toggleGroup data-id="${e(g.id)}" aria-expanded="${open}">${open ? 'Hide' : 'Open'}</button><button class=btn data-a=addToGroupModal data-id="${e(g.id)}">Add campaigns</button><button class="btn d" data-a=delGroup data-id="${e(g.id)}">Delete</button></div>
+<div class=sub>${e(g.description)}</div>
+${c ? `<div class=tw style="margin-top:8px;max-height:none"><table><thead><tr><th></th><th class=r>Spend</th><th class=r>Impressions</th><th class=r>Clicks</th><th class=r>CTR</th><th class=r>CPC</th><th></th></tr></thead><tbody>
+${combinedRow('Combined (current)', c.current, c.previous, null, 'All campaigns with usable data')}
+${combinedRow('Combined (previous)', c.previous, null, null, '')}
+${combinedRow(`Like-for-like change <span class=sub>(${lfl.campaignsCount} of ${g.campaignCount})</span>`, lfl.current, lfl.previous, lfl.changes, lfl.excludedCampaigns.length ? `Excluded from % change: ${lfl.excludedCampaigns.length}` : 'All campaigns comparable')}
+</tbody></table></div>${c.isProvisional ? '<div class=ban style="margin-top:8px">⚠ Provisional: current period includes today.</div>' : ''}${c.hasDelayedData ? '<div class=ban style="margin-top:8px">⏱ Includes delayed data — totals may be incomplete.</div>' : ''}` : '<div class=emp>No campaigns in this group yet.</div>'}
+${open ? `<div class=tw style="margin-top:8px;max-height:none"><table><caption class=sr>Campaigns in ${e(g.name)}</caption><thead><tr><th>Campaign</th><th>Status</th><th class=r>Spend</th><th class=r>CTR</th><th>Data</th><th></th></tr></thead><tbody>${g.members
+    .map(
+      (m) =>
+        `<tr><td><button class=lnk data-a=openCamp data-id=${m.campaignId}>${e(m.name)}</button> ${pl(m.platform)}</td><td>${stb(m.status)}</td><td class=r>${unavailableM(m) ? '—' : inr(m.current.spend)}</td><td class=r>${unavailableM(m) ? '—' : pcf(m.current.ctr)}</td><td class=sub>${m.note ? `<span class=w>${e(m.note)}</span>` : e(m.reliability.reasonText)}</td><td><button class=btn data-a=rmMember data-g="${e(g.id)}" data-id=${m.campaignId}>Remove</button></td></tr>`
+    )
+    .join('')}</tbody></table></div>` : ''}</div>`;
+}
+const unavailableM = (m) => m.reliability.reasonCode === 'f' || m.reliability.reasonCode === 'n';
+
+// ---- Alerts ---------------------------------------------------------------
+const CONDITION_LABEL = { drop: 'drops by', rise: 'rises by', below: 'falls below', above: 'goes above' };
+
+function alerts() {
+  const d = S.alertsData;
+  if (!d) return '<div class="card emp">Loading alerts…</div>';
+  const live = d.triggers.filter((t) => t.status === 'open' || t.status === 'opened');
+  const past = d.triggers.filter((t) => !(t.status === 'open' || t.status === 'opened'));
+  const trig = (t) => `<div class="iss ${t.provisional ? '' : 'High'}" style="padding:7px 10px"><div class=sp><b>${e(t.ruleName)}</b> · ${e(t.entityLabel)} ${t.provisional ? '<span class="bd warn" title="Evaluated on partial, delayed or learning-phase data">Provisional</span>' : ''}${t.feedback ? `<span class="bd n">Reviewed: ${e(t.feedback.replace('_', ' '))}</span>` : ''}<div class=sub>${e(t.message)} · ${e(t.triggeredAt.replace('T', ' ').slice(0, 16))} · ${e(t.period)}${t.excludedCount ? ` · ${t.excludedCount} campaign(s) excluded` : ''}</div></div>${
+    t.status === 'open' || t.status === 'opened'
+      ? `<button class="btn p" data-a=openTrigger data-id=${t.id}>Investigate</button><button class=btn data-a=disTrigger data-id=${t.id}>Dismiss</button>`
+      : `<span class=sub>${e(t.status)}</span>`
+  }${t.feedback ? '' : `<span class=sub style="white-space:nowrap">Was it right? <button class=btn data-a=fb data-id=${t.id} data-v=valid>Valid</button><button class=btn data-a=fb data-id=${t.id} data-v=misleading title="The data or rule made this alert misleading">Misleading</button><button class=btn data-a=fb data-id=${t.id} data-v=not_actionable>Not actionable</button></span>`}</div>`;
+
+  return `<div class=row><div><h1>Alerts</h1><div class=sub>You set the thresholds. One issue raises one alert: repeat triggers are deduplicated with a cooldown.</div></div><span class=sp></span><button class=btn data-a=evalAlerts>⟳ Run evaluation</button><button class="btn p" data-a=newAlert>+ New alert</button></div>
+<div class=card style="margin-top:14px"><h2>Triggered alerts</h2><div style="margin-top:10px">${live.length ? live.map(trig).join('') : '<div class=emp>No triggered alerts need attention.</div>'}</div>${past.length ? `<details style="margin-top:8px"><summary class=sub>${past.length} earlier (dismissed or recovered)</summary><div style="margin-top:8px">${past.map(trig).join('')}</div></details>` : ''}</div>
+<div class=card><h2>Alert rules</h2>${
+    d.rules.length
+      ? `<div class=tw style="max-height:none;margin-top:8px"><table><thead><tr><th>Name</th><th>Watching</th><th>Rule</th><th>Compared with</th><th>Frequency</th><th>Status</th><th>Last triggered</th><th></th></tr></thead><tbody>${d.rules
+          .map(
+            (r) =>
+              `<tr><td><b>${e(r.name)}</b></td><td>${e(r.entityLabel)}</td><td>${e(r.metricLabel)} ${CONDITION_LABEL[r.condition]} ${r.threshold.toLocaleString('en-IN')}${r.condition === 'drop' || r.condition === 'rise' ? '%' : ''}</td><td>${e(r.comparisonPeriod)}</td><td>${e(r.frequency)}</td><td>${r.status === 'Active' ? '<span class="bd ok">Active</span>' : '<span class="bd n">Paused</span>'}</td><td class=sub>${e(r.lastTriggeredAt)}</td><td><button class=btn data-a=ruleToggle data-id="${e(r.id)}" data-v="${r.status === 'Active' ? 'Paused' : 'Active'}">${r.status === 'Active' ? 'Pause' : 'Resume'}</button><button class="btn d" data-a=ruleDel data-id="${e(r.id)}">Delete</button></td></tr>`
+          )
+          .join('')}</tbody></table></div>`
+      : '<div class=emp>No alert rules yet.</div>'
+  }</div>`;
+}
+
+// ---- Activity -------------------------------------------------------------
+function activity() {
+  const d = S.activityData;
+  if (!d) return '<div class="card emp">Loading activity…</div>';
+  return `<div class=row><div><h1>Activity Log</h1><div class=sub>Every change a planner makes, in order.</div></div><span class=sp></span>${sel('S.activityType', S.activityType, [['', 'All types'], 'Campaign', 'Group', 'Alert', 'Selection', 'System'])}</div>
+<div class=card style="margin-top:14px">${d.items.length ? `<div class=tw style="max-height:none"><table><thead><tr><th>When</th><th>Who</th><th>Type</th><th>Action</th><th>Related</th></tr></thead><tbody>${d.items.map((a) => `<tr><td class=sub>${e(a.timestampText)}</td><td>${e(a.userName)}</td><td><span class="bd info">${e(a.type)}</span></td><td>${e(a.actionText)}</td><td class=sub>${e(a.relatedEntity)}</td></tr>`).join('')}</tbody></table></div>` : '<div class=emp>No activity yet.</div>'}</div>`;
+}
+
+// ---- Success metrics ------------------------------------------------------
+const dur = (m) => (m == null ? '—' : m >= 120 ? `${(m / 60).toFixed(1)} h` : `${m.toFixed(1)} min`);
+const pctv = (v) => (v == null ? '—' : `${v}%`);
+const decisionBadge = (d) => `<span class="bd ${d.status === 'ok' ? 'ok' : d.status === 'investigate' ? 'bad' : 'n'}">${d.status === 'ok' ? 'On track' : d.status === 'investigate' ? 'Investigate' : 'Not enough data'}</span>`;
+
+function metrics() {
+  const m = S.metricsData;
+  if (!m) return '<div class="card emp">Loading success metrics…</div>';
+  const ns = m.northStar;
+  const dr = m.drivers;
+  const g = m.guardrail;
+  const mw = m.manualWorkflow;
+  const dec = m.decision;
+  return `<div class=row><div><h1>Success metrics</h1><div class=sub>Measured from product events · last ${m.window.days} days · proposed thresholds, not benchmarks.</div></div><span class=sp></span><button class=btn data-a=refresh>⟳ Refresh</button></div>
+<div class=card style="background:var(--navy);color:#fff;margin-top:14px"><div class=sub style="color:#8E9ABF">THE ONE NUMBER THAT MATTERS</div><div style="font-size:13px">${e(ns.name)}</div><div class=kv style="font-size:30px;margin:6px 0">${dur(ns.medianMinutes)}</div><div style="color:#C9D1E8">Median of detect-to-investigate (A) · ${ns.sampleSize} issue${ns.sampleSize === 1 ? '' : 's'} investigated</div>
+<div class=row style="margin-top:10px"><div><span class=sub style="color:#8E9ABF">A · Detect → investigate (incl. notification delay)</span><div><b>${dur(ns.detectToInvestigateMedianMinutes)}</b></div></div><div><span class=sub style="color:#8E9ABF">B · Governance opened → issue opened (${ns.activeSessionSampleSize})</span><div><b>${dur(ns.activeSessionMedianMinutes)}</b></div></div></div></div>
+<div class=kp style="grid-template-columns:repeat(4,1fr)">${kpi('Weekly action rate', pctv(dr.weeklyGovernanceActionRate), 'Planners with ≥1 meaningful action ÷ weekly active planners', `${dr.weeklyActivePlanners} weekly active planner(s)`)}${kpi('Group adoption', pctv(dr.groupAdoptionRate), 'Planners who create AND revisit a group ÷ weekly active planners', '')}${kpi('Alert action rate', pctv(dr.alertActionRate), 'Eligible triggered alerts that led to opening the affected campaign', `${dr.eligibleTriggeredAlerts} eligible alert(s)`)}${kpi('Alert false-positive rate', pctv(g.alertFalsePositiveRate), 'Primary guardrail: misleading ÷ reviewed triggered alerts. Dismissals are not false positives.', `${g.misleadingAlerts} of ${g.reviewedTriggeredAlerts} reviewed`)}</div>
+<div class=card><h2>Diagnostics</h2><div class=sub style="margin-top:6px">Alert dismissal rate: <b>${pctv(g.alertDismissalRate)}</b> (a dismissed alert is not automatically a false positive) · CSV exports this window: <b>${mw.exportClicks}</b> (${mw.exportsPerWeek}/week)</div></div>
+<div class=card><div class=row><h2>60-day decision</h2><span class=sp></span><span class=sub>Pre-launch export baseline (per week)</span><input type=number min=1 id=baseline data-set=S.exportBaseline value="${e(S.exportBaseline)}" style="width:90px" placeholder="unset"><button class=btn data-a=applyBaseline>Apply</button></div>
+<table style="margin-top:8px"><tbody>
+<tr><td><b>Alert quality</b></td><td>${decisionBadge(dec.alertQuality)}</td><td class=sub>${e(dec.alertQuality.detail)}</td></tr>
+<tr><td><b>Workflow adoption</b></td><td>${decisionBadge(dec.workflowAdoption)}</td><td class=sub>${e(dec.workflowAdoption.detail)}</td></tr>
+<tr><td><b>Manual workflow reduction</b></td><td>${decisionBadge(dec.manualWorkflowReduction)}</td><td class=sub>${e(dec.manualWorkflowReduction.detail)}</td></tr>
+</tbody></table>
+<div style="margin-top:8px"><b>Overall:</b> ${dec.overall === 'continue' ? 'Continue investing' : dec.overall === 'investigate' ? 'Investigate and iterate before further investment' : 'Not enough data yet to decide'}</div></div>
+<div class="sub" style="margin-top:8px">${e(m.methodology)}</div>`;
+}
+
+// ---- Modals ---------------------------------------------------------------
+const mo = (title, body, wide) => `<div class=mo data-a=modalBg><div class="md ${wide ? 'l' : ''}" role=dialog aria-modal=true aria-label="${e(title)}" tabindex=-1><div class=row><h2>${e(title)}</h2><span class=sp></span><button class=btn data-a=closeModal aria-label="Close">✕</button></div>${body}</div></div>`;
+
+function drillBody() {
+  const m = S.modal;
+  const d = m.data;
+  if (!d) return '<div class=emp>Loading…</div>';
+  const c = d.campaign;
+  const ads = d.adSets;
+  const picked = m.sel.length;
+  const total = ads.length;
+  const adCell = (a, col) => {
+    const r = a.reliability.reasonCode;
+    if (r === 'f') return '<span class=n title="Sync failed — data unavailable">—</span>';
+    const cur = a.current;
+    const ch = a.changes;
+    const unrel = !a.reliability.isReliable;
+    if (col === 'spend') return `${inr(cur.spend)}<div class=s2>${a.previous.spend ? `prev ${inr(a.previous.spend)} · ${dl(ch.spend.relativePct, 0)}` : 'No baseline'}</div>`;
+    if (col === 'impr') return `${num(cur.impressions)}<div class=s2>${a.previous.impressions ? dl(ch.impressions.relativePct, 1) : 'No baseline'}</div>`;
+    if (col === 'clicks') return `${num(cur.clicks)}<div class=s2>${a.previous.clicks ? dl(ch.clicks.relativePct, 1) : 'No baseline'}</div>`;
+    if (col === 'ctr') return `${pcf(cur.ctr)}<div class=s2>${unrel ? `<span class=w title="${e(a.reliability.reasonText)}">${r === 'l' ? '⚠ Insufficient data' : e(a.reliability.flagText)}</span>` : ppd(ch.ctr)}</div>`;
+    return `${inr2(cur.cpc)}<div class=s2>${unrel ? `<span class=w title="${e(a.reliability.reasonText)}">${r === 'l' ? '⚠ Insufficient data' : e(a.reliability.flagText)}</span>` : dl(ch.cpc.relativePct, -1)}</div>`;
+  };
+
+  const issues = c.issues || [];
+  return `<div class=sub>${pl(c.platform)} · ${e(c.objective)} · ${stb(c.status)} · <span title="${e(c.reliability.reasonText)}">${c.reliability.isReliable ? '✓ Complete data' : e(c.reliability.flagText)}</span></div>
+<div class=sub>${e(c.raw)}</div>
+${!c.reliability.isReliable ? `<div class=ban style="margin-top:8px">${e(c.reliability.reasonText)}</div>` : ''}
+${issues.length ? `<div style="margin-top:10px">${issues.map((i) => `<div class="iss ${i.severity}" style="padding:7px 10px"><span class="bd ${sevc(i.severity)}">${i.severity}</span><div class=sp><b>${e(i.metric)}: ${e(i.changeDisplay)}</b> <span class=sub>· detected ${e(i.detectedAt)}</span><div class=sub>${e(i.whyText)}</div></div>${i.state === 'open' || i.state === 'reviewed' ? `<button class="btn p" data-a=resolveIssue data-id="${e(i.id)}">Mark resolved</button>` : ''}</div>`).join('')}</div>` : ''}
+<h2 style="margin-top:14px">Ad sets <span class=sub>(drilldown stops here; deeper analysis stays in the ad platforms)</span></h2>
+${total === 0 ? `<div class=emp><b>${NO_ADSETS}</b><p>It is excluded from comparisons and ad-set-level alerts.</p></div>` : `<div class=row style="margin:8px 0"><label><input type=checkbox data-a=ddAll aria-label="Select all ad sets in this campaign" ${picked === total ? 'checked' : ''} ${picked > 0 && picked < total ? 'data-ind=1' : ''}> <b>${e(c.name)}</b></label><span class=sub aria-live=polite>${picked} of ${total} ad sets selected</span></div>
+<div class=tw style="max-height:none"><table><caption class=sr>Ad sets in ${e(c.name)}</caption><thead><tr><th></th><th>Ad set</th><th>Status</th><th class=r>Spend</th><th class=r>Impressions</th><th class=r>Clicks</th><th class=r>CTR</th><th class=r>CPC</th></tr></thead><tbody>${ads
+    .map(
+      (a) =>
+        `<tr class="${m.sel.includes(a.id) ? 'sl' : ''}"><td><input type=checkbox data-a=ddSel data-id="${e(a.id)}" aria-label="Select ${e(a.name)}" ${m.sel.includes(a.id) ? 'checked' : ''}></td><td><b>${e(a.name)}</b><div class=s2>${e(a.audience)}</div></td><td>${stb(a.status)}</td><td class=r>${adCell(a, 'spend')}</td><td class=r>${adCell(a, 'impr')}</td><td class=r>${adCell(a, 'clicks')}</td><td class=r>${adCell(a, 'ctr')}</td><td class=r>${adCell(a, 'cpc')}</td></tr>`
+    )
+    .join('')}</tbody></table></div>
+${picked ? `<div class=bar><b>${picked} of ${total} ad sets selected</b><span class=sub style="color:#C9D1E8">Actions apply to these ad sets only, not the whole campaign.</span><span class=sp></span><button class=btn data-a=ddPause>Pause…</button><button class=btn data-a=ddResume>Resume…</button><button class=btn data-a=ddClear>Clear</button></div>` : ''}`}`;
+}
+
+function groupFormBody() {
+  const f = S.modal.form;
+  return `<form data-a=none onsubmit="return false"><div class=fl><label for=gn>Group name</label><input id=gn data-f=name value="${e(f.name)}" maxlength=80 placeholder="e.g. Diwali Performance"></div>
+<div class=fl><label for=gd>Description (optional)</label><input id=gd data-f=description value="${e(f.description)}" maxlength=200></div>
+<div class=sub>${S.sel.length ? `${S.sel.length} selected campaign(s) will be added.` : 'Create the group first; add campaigns from the group card.'}</div>
+${f.error ? `<div class=er role=alert>${e(f.error)}</div>` : ''}
+<div class=row style="margin-top:12px"><span class=sp></span><button class=btn data-a=closeModal type=button>Cancel</button><button class="btn p" data-a=saveGroup type=button>Create group</button></div></form>`;
+}
+
+function addGroupBody() {
+  const m = S.modal;
+  const q = (m.q || '').toLowerCase();
+  const list = (m.campaigns || []).filter((c) => !q || c.name.toLowerCase().includes(q));
+  const inGroup = new Set(m.memberIds || []);
+  return `<div class=fl><label for=agq>Search campaigns</label><input id=agq data-f=q value="${e(m.q || '')}" placeholder="Search…"></div>
+${m.groupChoice ? `<div class=fl><label for=agg>Add to group</label><select id=agg data-f=groupId>${(S.groupsData?.groups || []).map((g) => `<option value="${e(g.id)}" ${m.groupId === g.id ? 'selected' : ''}>${e(g.name)}</option>`).join('')}</select></div>` : ''}
+<div class=ck>${list.map((c) => `<label><input type=checkbox data-a=agPick data-id=${c.campaignId} ${m.pick.includes(c.campaignId) ? 'checked' : ''} ${inGroup.has(c.campaignId) ? 'disabled' : ''}> ${e(c.name)} ${pl(c.platform)} <span class=sub>${e(c.status)}${inGroup.has(c.campaignId) ? ' · already in group' : ''}</span></label>`).join('') || '<div class=sub>No campaigns match.</div>'}</div>
+<div class=sub style="margin-top:6px" aria-live=polite>${m.pick.length} selected · a campaign can appear only once in a group</div>
+<div class=row style="margin-top:12px"><span class=sp></span><button class=btn data-a=closeModal>Cancel</button><button class="btn p" data-a=saveAddGroup ${m.pick.length ? '' : 'disabled'}>Add to group</button></div>`;
+}
+
+function alertFormBody() {
+  const m = S.modal;
+  const f = m.form;
+  const isChange = f.condition === 'drop' || f.condition === 'rise';
+  const rec = m.rec;
+  const recKeys = new Set((rec?.recommended || []).map((r) => r.key));
+  const metrics = rec?.allMetrics || [];
+  const pool =
+    f.entityType === 'group'
+      ? (S.groupsData?.groups || []).map((g) => ({ id: g.id, label: `${g.name} (${g.campaignCount})` }))
+      : f.entityType === 'adsets'
+        ? (m.adSets || []).map((a) => ({ id: a.id, label: `${a.campaignName} › ${a.name}` }))
+        : (m.campaigns || []).map((c) => ({ id: String(c.campaignId), label: `${c.name} · ${c.objective}` }));
+  const test = m.test;
+  const row = (r) => `<li>${e(r.label)} — ${e(r.state === 'excluded' ? r.reason : r.message)}${r.provisional ? ' <span class="bd warn">provisional</span>' : ''}</li>`;
+  return `<div class=fl><label for=an>Name</label><input id=an data-f=name value="${e(f.name)}" maxlength=80 placeholder="e.g. Lead CPC spike"></div>
+<div class=fl><label for=aet>Watch</label><select id=aet data-f=entityType><option value=group ${f.entityType === 'group' ? 'selected' : ''}>A group</option><option value=campaigns ${f.entityType === 'campaigns' ? 'selected' : ''}>Campaigns</option><option value=adsets ${f.entityType === 'adsets' ? 'selected' : ''}>Ad sets</option></select></div>
+<div class=ck>${pool.map((p) => `<label><input type=checkbox data-a=alEnt data-id="${e(p.id)}" ${f.entityIds.includes(p.id) ? 'checked' : ''}> ${e(p.label)}</label>`).join('') || '<div class=sub>Nothing to select yet.</div>'}</div>
+${rec ? `<div class=sub style="margin:6px 0" aria-live=polite>${e(rec.note)}${rec.recommended.length ? ` <b>Recommended:</b> ${rec.recommended.map((r) => e(r.label)).join(', ')}` : ''}</div>` : ''}
+<div class=fl><label for=am>Metric</label><select id=am data-f=metric>${metrics.map((x) => `<option value="${e(x.key)}" ${f.metric === x.key ? 'selected' : ''}>${e(x.label)}${recKeys.has(x.key) ? ' ★ recommended' : ''}${x.applicableObjectives ? ` (${x.applicableObjectives.join('/')} only)` : ''}</option>`).join('') || '<option value=ctr>CTR</option>'}</select></div>
+<div class=row><div class=fl style="flex:1"><label for=ac>Condition</label><select id=ac data-f=condition>${Object.entries(CONDITION_LABEL).map(([k, v]) => `<option value=${k} ${f.condition === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div><div class=fl style="flex:1"><label for=at>Threshold ${isChange ? '(%)' : '(value)'}</label><input id=at data-f=threshold type=number min=0 step=any value="${e(f.threshold)}"></div></div>
+<div class=row><div class=fl style="flex:1"><label for=ap>Compared with</label><select id=ap data-f=comparisonPeriod>${['Previous day', 'Previous 7 days', 'Previous 30 days'].map((p) => `<option ${f.comparisonPeriod === p ? 'selected' : ''}>${p}</option>`).join('')}</select></div><div class=fl style="flex:1"><label for=af>Notify</label><select id=af data-f=frequency>${['Immediate', 'Daily summary'].map((p) => `<option ${f.frequency === p ? 'selected' : ''}>${p}</option>`).join('')}</select></div></div>
+<div class=fl><label for=ar>Recipient email</label><input id=ar data-f=recipient type=email value="${e(f.recipient)}"></div>
+${f.error ? `<div class=er role=alert>${e(f.error)}</div>` : ''}
+${test ? `<div class=card style="margin:10px 0 0;padding:10px"><b>Test against current data</b> <span class=sub>(dry run, nothing saved)</span><div>Would trigger now: <b>${test.wouldTrigger.length}</b> · within threshold: ${test.ok.length} · excluded: ${test.excluded.length}</div>${test.wouldTrigger.length ? `<ul>${test.wouldTrigger.map(row).join('')}</ul>` : ''}${test.excluded.length ? `<details><summary class=sub>Why ${test.excluded.length} excluded</summary><ul>${test.excluded.map(row).join('')}</ul></details>` : ''}</div>` : ''}
+<div class=row style="margin-top:12px"><button class=btn data-a=testAlert>Test against current data</button><span class=sp></span><button class=btn data-a=closeModal>Cancel</button><button class="btn p" data-a=saveAlert>Create alert</button></div>`;
+}
+
+function modalHtml() {
+  const m = S.modal;
+  if (!m) return '';
+  if (m.type === 'drill') return mo(m.data?.campaign?.name || 'Campaign', drillBody(), true);
+  if (m.type === 'group') return mo('New group', groupFormBody());
+  if (m.type === 'addGroup') return mo(m.title, addGroupBody());
+  if (m.type === 'alert') return mo('New alert', alertFormBody(), true);
+  return '';
+}
+
+function confirmHtml() {
+  const c = S.confirm;
+  if (!c) return '';
+  return `<div class=mo style="z-index:30"><div class=md role=alertdialog aria-modal=true aria-label="${e(c.title)}" tabindex=-1><h2>${e(c.title)}</h2><div style="margin:10px 0">${c.lines.map((l) => `<div>${e(l)}</div>`).join('')}</div><div class=sub>Nothing happens until you confirm.</div>${c.error ? `<div class=er role=alert>${e(c.error)}</div>` : ''}<div class=row style="margin-top:12px"><span class=sp></span><button class=btn data-a=confirmNo>Cancel</button><button class="btn p" data-a=confirmYes ${c.busy ? 'disabled' : ''}>${e(c.label || 'Confirm')}</button></div></div></div>`;
+}
+
+let lastFocus = null;
+function renderModals() {
+  const host = $('#modal');
+  const host2 = $('#modal2');
+  const scrollTop = host.querySelector('.md')?.scrollTop ?? 0;
+  const active = document.activeElement;
+  const key = active && host.contains(active) ? active.dataset.f || active.id : null;
+  const wasOpen = !!host.firstChild;
+  host.innerHTML = modalHtml();
+  host2.innerHTML = confirmHtml();
+  const md = host.querySelector('.md');
+  if (md) {
+    md.scrollTop = scrollTop;
+    if (!wasOpen) {
+      lastFocus = document.activeElement;
+      md.focus();
+    } else if (key) {
+      (host.querySelector(`[data-f="${key}"]`) || host.querySelector(`#${CSS.escape(key)}`))?.focus();
+    }
+  } else if (wasOpen && lastFocus) {
+    lastFocus.focus?.();
+    lastFocus = null;
+  }
+  const cm = host2.querySelector('.md');
+  if (cm) cm.focus();
+  syncIndeterminate();
+}
+
+function syncIndeterminate() {
+  document.querySelectorAll('[data-ind]').forEach((el) => {
+    el.indeterminate = true;
+  });
 }
 
 const NAV = [
@@ -232,30 +511,177 @@ const NAV = [
   ['groups', 'Groups', '❖'],
   ['alerts', 'Alerts', '⚑'],
   ['activity', 'Activity Log', '⟲'],
+  ['metrics', 'Success metrics', '◎'],
   ['settings', 'Settings', '⚙'],
 ];
+const PAGE_NAME = Object.fromEntries(NAV.map((n) => [n[0], n[1]]));
 
 function render() {
-  const crumbs = ['Governance', S.pg === 'overview' ? 'Overview' : S.pg === 'campaigns' ? 'Campaigns' : S.pg];
+  const crumbs = ['Governance', PAGE_NAME[S.pg] || S.pg];
   let body = '';
   if (S.pg === 'overview') body = overview();
   else if (S.pg === 'campaigns') body = campaigns();
-  else body = `<div class=card><h2>${S.pg.toUpperCase()}</h2><p>Screen will be wired in upcoming phase.</p></div>`;
+  else if (S.pg === 'groups') body = groups();
+  else if (S.pg === 'alerts') body = alerts();
+  else if (S.pg === 'activity') body = activity();
+  else if (S.pg === 'metrics') body = metrics();
+  else body = `<div class=card><h2>${e(PAGE_NAME[S.pg] || S.pg)}</h2><p>Account settings are not part of this release.</p></div>`;
+
+  // Preserve scroll and focus across full re-renders (state discipline)
+  const sy = window.scrollY;
+  const tw = document.querySelector('.tw');
+  const twTop = tw ? tw.scrollTop : 0;
+  const ae = document.activeElement;
+  const focusSel = ae && ae.id && $('#app').contains(ae) ? '#' + CSS.escape(ae.id) : null;
+  const selStart = ae && typeof ae.selectionStart === 'number' ? ae.selectionStart : null;
 
   $('#app').innerHTML = `<aside class="${S.col ? 'c' : ''}"><div class=brand>⚡<span class=lb> VAJRA<small>GOVERNANCE</small></span></div>${NAV.map((n) => `<button class="nv ${S.pg === n[0] ? 'a' : ''}" data-a=nav data-pg=${n[0]} title="${n[1]}" ${S.pg === n[0] ? 'aria-current=page' : ''}><span>${n[2]}</span><span class=lb>${n[1]}</span></button>`).join('')}<span class=sp></span><button class=nv data-a=col title="Collapse sidebar"><span>${S.col ? '»' : '«'}</span><span class=lb>Collapse</span></button></aside>
-<div class=mn><header><button class=btn data-a=col aria-label="Toggle sidebar">☰</button><div class=cr>${crumbs.map((c, i) => (i === crumbs.length - 1 ? `<b aria-current=page>${e(c)}</b>` : `<button class=lnk data-a=nav data-pg=${c.toLowerCase()}>${e(c)}</button> / `)).join('')}</div><select aria-label="Account"><option>ACME Cooling India</option></select><span class=sub>${fr(S.cs, S.ce)} vs ${fr(S.ps, S.pe)}</span><div style="position:relative"><button class=btn aria-label="Notifications">🔔 <b class=bad>${S.overviewData?.issues?.length || 0}</b></button></div><div style="position:relative"><button class=btn>PN ▾</button></div></header><main id=main tabindex=-1 ${S.load ? 'style="opacity:.6" aria-busy=true' : ''}>${body}</main></div>`;
+<div class=mn><header><button class=btn data-a=col aria-label="Toggle sidebar">☰</button><div class=cr>${crumbs.map((c, i) => (i === crumbs.length - 1 ? `<b aria-current=page>${e(c)}</b>` : `<button class=lnk data-a=nav data-pg=overview>${e(c)}</button> / `)).join('')}</div><select aria-label="Account"><option>ACME Cooling India</option></select><span class=sub>${fr(S.cs, S.ce)} vs ${fr(S.ps, S.pe)}</span><div style="position:relative"><button class=btn aria-label="Open issues: ${S.overviewData?.issues?.length || 0}" data-a=bell>🔔 <b class=bad>${S.overviewData?.issues?.length || 0}</b></button></div><div style="position:relative"><button class=btn>PN ▾</button></div></header><main id=main tabindex=-1 ${S.load ? 'style="opacity:.6" aria-busy=true' : ''}>${body}</main></div>`;
+
+  window.scrollTo(0, sy);
+  const tw2 = document.querySelector('.tw');
+  if (tw2) tw2.scrollTop = twTop;
+  if (focusSel) {
+    const el = $(focusSel);
+    if (el) {
+      el.focus();
+      if (selStart != null && el.setSelectionRange) {
+        try {
+          el.setSelectionRange(selStart, selStart);
+        } catch {
+          /* non-text input */
+        }
+      }
+    }
+  }
+  syncIndeterminate();
 }
 
-// Action Dispatcher
+function rerenderAll() {
+  render();
+  renderModals();
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+function ask(cfg) {
+  S.confirm = { label: 'Confirm', error: '', busy: false, ...cfg };
+  renderModals();
+}
+
+async function openDrill(id, source) {
+  S.modal = { type: 'drill', id, data: null, sel: [] };
+  renderModals();
+  api.track('campaign_opened', { campaignId: Number(id), source });
+  try {
+    S.modal.data = await api.getCampaign(id, dateParams());
+  } catch (err) {
+    toast(err.message, 1);
+    S.modal = null;
+  }
+  renderModals();
+}
+
+async function refreshAfterMutation() {
+  await loadData();
+  if (S.modal?.type === 'drill') {
+    try {
+      const keep = S.modal.sel;
+      S.modal.data = await api.getCampaign(S.modal.id, dateParams());
+      S.modal.sel = keep.filter((id) => S.modal.data.adSets.some((a) => a.id === id));
+    } catch {
+      /* keep stale view */
+    }
+  }
+  renderModals();
+}
+
+function bulkConfirm(action, campaignIds, adSetIds, labelCtx) {
+  const verb = action === 'pause' ? 'Pause' : 'Resume';
+  const total = S.campaignsData?.pagination.total ?? campaignIds.length;
+  const lines = adSetIds.length
+    ? [`${verb} ${adSetIds.length} of ${labelCtx.adSetTotal} ad sets in "${labelCtx.name}".`, 'Only the selected ad sets change — not the whole campaign.']
+    : [`${verb} ${campaignIds.length} of ${total} campaign${total === 1 ? '' : 's'}.`, 'Only the selected campaigns change. Ended campaigns are skipped.'];
+  ask({
+    title: `${verb} — confirm scope`,
+    lines,
+    label: `${verb} ${adSetIds.length || campaignIds.length}`,
+    run: async () => {
+      const r = await api.bulkStatus({ action, campaignIds, adSetIds, confirm: true, totalCampaigns: total });
+      const n = r.applied.length;
+      toast(`${verb}d ${n} item${n === 1 ? '' : 's'}${r.skipped.length ? ` · ${r.skipped.length} skipped (${r.skipped[0].reason})` : ''}.`, r.skipped.length && !n ? 1 : 0);
+      S.sel = [];
+      if (S.modal?.type === 'drill') S.modal.sel = [];
+      await refreshAfterMutation();
+    },
+  });
+  api.track('bulk_selected', { selectedCount: adSetIds.length || campaignIds.length, source: adSetIds.length ? 'drilldown' : 'campaign_table', payload: { action } });
+}
+
+const csvCell = (v) => {
+  if (v == null) return '';
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+async function exportCsv() {
+  const res = await guarded(() => api.getCampaigns({ ...dateParams(), q: T.q, plat: T.plat, obj: T.obj, st: T.st, perf: T.perf, tab: T.tab, sort: T.sort, dir: T.dir, page: 0, size: 200 }));
+  if (!res) return;
+  const rows = S.sel.length ? res.items.filter((r) => S.sel.includes(r.campaignId)) : res.items;
+  const header = ['Campaign', 'Platform', 'Objective', 'Status', 'Data state', 'Spend', 'Prev spend', 'Impressions', 'Clicks', 'CTR %', 'CPC'];
+  const lines = rows.map((r) => {
+    const gone = unavailable(r); // unavailable data stays blank, never 0
+    return [r.name, r.platform, r.objective, r.status, r.reliability.status, gone ? '' : r.current.spend, gone ? '' : r.previous.spend, gone ? '' : r.current.impressions, gone ? '' : r.current.clicks, gone ? '' : r.current.ctr?.toFixed(2), gone ? '' : r.current.cpc?.toFixed(2)].map(csvCell).join(',');
+  });
+  const blob = new Blob([[header.join(','), ...lines].join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `vajra-campaigns-${S.ce}.csv`;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  api.track('export_clicked', { source: S.pg, selectedCount: S.sel.length, payload: { sinceOpenedSec: Math.round((Date.now() - S.openedAt) / 1000), rows: rows.length } });
+  toast(`Exported ${rows.length} campaign${rows.length === 1 ? '' : 's'}.`);
+}
+
+const blankAlert = () => ({ name: '', entityType: 'group', entityIds: [], metric: 'ctr', condition: 'drop', threshold: '15', comparisonPeriod: 'Previous 7 days', recipient: 'planner@acme.example', frequency: 'Daily summary', error: '' });
+
+async function refreshRecommendation() {
+  const f = S.modal.form;
+  if (!f.entityIds.length) {
+    S.modal.rec = S.modal.rec ? { ...S.modal.rec, recommended: [], isMixed: true, note: 'Select what to watch to see recommended metrics.' } : null;
+    return;
+  }
+  try {
+    S.modal.rec = await api.getRecommendations(f.entityType, f.entityIds);
+    // objective-aware default: pre-select the first recommendation unless the planner already chose a metric
+    if (!S.modal.metricTouched && S.modal.rec.recommended.length) f.metric = S.modal.rec.recommended[0].key;
+  } catch {
+    /* recommendation is optional */
+  }
+}
+
+const alertPayload = (f) => ({ name: f.name, entityType: f.entityType, entityIds: f.entityIds.map((x) => (f.entityType === 'campaigns' ? Number(x) : x)), metric: f.metric, condition: f.condition, threshold: Number(f.threshold), comparisonPeriod: f.comparisonPeriod, recipient: f.recipient, frequency: f.frequency });
+
 const A = {
+  none: () => {},
   nav: (d) => {
     S.pg = d.pg;
+    S.sel = S.pg === 'overview' || S.pg === 'campaigns' ? S.sel : [];
+    if (d.pg === 'groups') api.track('group_opened', { source: 'nav' });
+    loadData({ evaluate: d.pg === 'alerts' });
+  },
+  bell: () => {
+    S.pg = 'overview';
     loadData();
   },
   pre: (d) => {
     if (d.v === 'c') return;
     [S.cs, S.ce, S.ps, S.pe] = PRE[d.v];
     S.auto = true;
+    api.track('period_changed', { source: 'preset', payload: { preset: d.v } });
     loadData();
     toast(`Comparing ${fr(S.cs, S.ce)} with ${fr(S.ps, S.pe)}`);
   },
@@ -327,22 +753,256 @@ const A = {
     S.issAll = !S.issAll;
     render();
   },
-  refresh: () => {
-    loadData();
+  refresh: async () => {
+    if (S.pg === 'overview') await guarded(() => api.evaluateAlerts());
+    await loadData({ evaluate: S.pg === 'alerts' });
     toast('Data refreshed from backend.');
   },
-  openCamp: (d) => {
-    toast(`Drill-down for campaign ${d.id} wired in Phase 3.`);
+  exportCsv,
+
+  // ---- issues
+  openCamp: (d) => openDrill(d.id, S.pg),
+  openIssue: async (d) => {
+    await guarded(() => api.openIssue(d.id, 'triage')); // issue_opened: the measured investigation moment
+    openDrill(d.cid, 'issue');
   },
-  revIssue: (d) => {
-    toast(`Issue ${d.id} reviewed (Phase 3 flow).`);
+  revIssue: async (d) => {
+    if (await guarded(() => api.reviewIssue(d.id), 'Issue marked reviewed.')) loadData();
   },
-  disIssue: (d) => {
-    toast(`Issue ${d.id} dismissed (Phase 3 flow).`);
+  disIssue: async (d) => {
+    if (await guarded(() => api.dismissIssue(d.id, 'triage'), 'Issue dismissed.')) loadData();
   },
+  resolveIssue: async (d) => {
+    if (await guarded(() => api.resolveIssue(d.id, 'drilldown'), 'Issue resolved.')) refreshAfterMutation();
+  },
+
+  // ---- modal plumbing
+  closeModal: () => {
+    S.modal = null;
+    S.confirm = null;
+    renderModals();
+  },
+  modalBg: (d, ev) => {
+    if (ev.target.classList.contains('mo')) A.closeModal();
+  },
+  confirmNo: () => {
+    api.track('bulk_action_cancelled', { source: 'confirm' });
+    S.confirm = null;
+    renderModals();
+  },
+  confirmYes: async () => {
+    const c = S.confirm;
+    if (!c || c.busy) return;
+    c.busy = true;
+    c.error = '';
+    renderModals();
+    try {
+      await c.run();
+      S.confirm = null;
+    } catch (err) {
+      c.busy = false;
+      c.error = err.message;
+    }
+    renderModals();
+  },
+
+  // ---- bulk (campaign table)
+  bulkPause: () => bulkConfirm('pause', S.sel, [], {}),
+  bulkResume: () => bulkConfirm('resume', S.sel, [], {}),
+  bulkAddGroup: async () => {
+    const [g, all] = await Promise.all([S.groupsData ? Promise.resolve(S.groupsData) : guarded(() => api.getGroups(dateParams())), guarded(() => api.getCampaigns({ ...dateParams(), size: 200 }))]);
+    if (!g || !all) return;
+    S.groupsData = g;
+    if (!g.groups.length) return toast('Create a group first (Groups → New group).', 1);
+    S.modal = { type: 'addGroup', title: `Add ${S.sel.length} campaign(s) to a group`, groupChoice: true, groupId: g.groups[0].id, campaigns: all.items.filter((c) => S.sel.includes(c.campaignId)), pick: [...S.sel], q: '', memberIds: g.groups[0].members.map((m) => m.campaignId) };
+    renderModals();
+  },
+
+  // ---- drilldown ad-set selection
+  ddSel: (d) => {
+    const m = S.modal;
+    m.sel = m.sel.includes(d.id) ? m.sel.filter((x) => x !== d.id) : [...m.sel, d.id];
+    renderModals();
+  },
+  ddAll: () => {
+    const m = S.modal;
+    const ids = m.data.adSets.map((a) => a.id);
+    m.sel = m.sel.length === ids.length ? [] : ids;
+    renderModals();
+  },
+  ddClear: () => {
+    S.modal.sel = [];
+    renderModals();
+  },
+  ddPause: () => bulkConfirm('pause', [], S.modal.sel, { name: S.modal.data.campaign.name, adSetTotal: S.modal.data.adSets.length }),
+  ddResume: () => bulkConfirm('resume', [], S.modal.sel, { name: S.modal.data.campaign.name, adSetTotal: S.modal.data.adSets.length }),
+
+  // ---- groups
+  toggleGroup: (d) => {
+    S.openGroups[d.id] = !S.openGroups[d.id];
+    if (S.openGroups[d.id]) api.track('group_opened', { groupId: d.id, source: 'groups_page' });
+    render();
+  },
+  newGroup: () => {
+    S.modal = { type: 'group', form: { name: '', description: '', error: '' } };
+    renderModals();
+  },
+  saveGroup: async () => {
+    const f = S.modal.form;
+    f.error = '';
+    try {
+      const r = await api.createGroup({ name: f.name, description: f.description, campaignIds: S.sel });
+      toast(`Group "${r.name}" created${r.added.length ? ` with ${r.added.length} campaign(s)` : ''}.`);
+      S.modal = null;
+      S.sel = [];
+      await loadData();
+      renderModals();
+    } catch (err) {
+      f.error = err.body?.details ? err.body.details.join('; ') : err.message;
+      renderModals();
+    }
+  },
+  addToGroupModal: async (d) => {
+    const all = await guarded(() => api.getCampaigns({ ...dateParams(), size: 200 }));
+    if (!all) return;
+    const g = S.groupsData.groups.find((x) => x.id === d.id);
+    S.modal = { type: 'addGroup', title: `Add campaigns to ${g.name}`, groupChoice: false, groupId: g.id, campaigns: all.items, pick: [], q: '', memberIds: g.members.map((m) => m.campaignId) };
+    renderModals();
+  },
+  agPick: (d) => {
+    const m = S.modal;
+    const id = +d.id;
+    m.pick = m.pick.includes(id) ? m.pick.filter((x) => x !== id) : [...m.pick, id];
+    renderModals();
+  },
+  saveAddGroup: async () => {
+    const m = S.modal;
+    try {
+      const r = await api.addToGroup(m.groupId, m.pick);
+      const dup = r.skipped.filter((s) => s.reason === 'duplicate').length;
+      toast(`Added ${r.added.length} campaign(s)${dup ? ` · ${dup} already in the group were not added again` : ''}.`);
+      S.modal = null;
+      S.sel = [];
+      await loadData();
+      renderModals();
+    } catch (err) {
+      // 409: every selected campaign was already a member — blocked so totals aren't double-counted
+      toast(err.message, 1);
+    }
+  },
+  rmMember: (d) => {
+    const g = S.groupsData.groups.find((x) => x.id === d.g);
+    const m = g.members.find((x) => String(x.campaignId) === d.id);
+    ask({
+      title: 'Remove from group?',
+      lines: [`Remove "${m.name}" from "${g.name}".`, "The group's combined totals will change."],
+      label: 'Remove',
+      run: async () => {
+        await api.removeFromGroup(d.g, d.id);
+        toast('Removed from group.');
+        await loadData();
+      },
+    });
+  },
+  delGroup: (d) => {
+    const g = S.groupsData.groups.find((x) => x.id === d.id);
+    ask({
+      title: `Delete group "${g.name}"?`,
+      lines: [`${g.campaignCount} campaign(s) stay in your account; only the group is removed.`],
+      label: 'Delete group',
+      run: async () => {
+        await api.deleteGroup(d.id);
+        toast('Group deleted.');
+        await loadData();
+      },
+    });
+  },
+
+  // ---- alerts
+  newAlert: async () => {
+    const [groups, all, ads] = await Promise.all([S.groupsData ? Promise.resolve(S.groupsData) : guarded(() => api.getGroups(dateParams())), guarded(() => api.getCampaigns({ ...dateParams(), size: 200 })), guarded(() => api.getAdSets())]);
+    if (!all) return;
+    S.groupsData = groups;
+    S.modal = { type: 'alert', form: blankAlert(), campaigns: all.items, adSets: ads?.items || [], rec: null, test: null, metricTouched: false };
+    // load the metric catalogue for the select
+    try {
+      const first = S.groupsData?.groups?.[0];
+      S.modal.rec = await api.getRecommendations('campaigns', [String(all.items[0].campaignId)]);
+      S.modal.rec = { ...S.modal.rec, recommended: [], isMixed: true, note: first ? 'Select what to watch to see recommended metrics.' : 'Select campaigns to watch.' };
+    } catch {
+      /* catalogue falls back to CTR */
+    }
+    renderModals();
+  },
+  alEnt: async (d) => {
+    const f = S.modal.form;
+    f.entityIds = f.entityIds.includes(d.id) ? f.entityIds.filter((x) => x !== d.id) : [...f.entityIds, d.id];
+    S.modal.test = null;
+    await refreshRecommendation();
+    renderModals();
+  },
+  testAlert: async () => {
+    const f = S.modal.form;
+    f.error = '';
+    try {
+      S.modal.test = await api.testAlert({ ...alertPayload(f), name: f.name || 'Test' });
+    } catch (err) {
+      S.modal.test = null;
+      f.error = err.body?.details ? err.body.details.join('; ') : err.message;
+    }
+    renderModals();
+  },
+  saveAlert: async () => {
+    const f = S.modal.form;
+    f.error = '';
+    try {
+      const r = await api.createAlert(alertPayload(f));
+      toast(`Alert created.${r.warnings.length ? ' ' + r.warnings[0] : ''}`, r.warnings.length);
+      S.modal = null;
+      await loadData({ evaluate: true });
+      renderModals();
+    } catch (err) {
+      f.error = err.body?.details ? err.body.details.join('; ') : err.message;
+      renderModals();
+    }
+  },
+  evalAlerts: async () => {
+    const r = await guarded(() => api.evaluateAlerts());
+    if (r) toast(`Evaluated ${r.evaluatedRules} rule(s): ${r.fired.length} new, ${r.suppressedDuplicates} duplicate(s) suppressed, ${r.recovered} recovered.`);
+    loadData();
+  },
+  ruleToggle: async (d) => {
+    if (await guarded(() => api.setAlertStatus(d.id, d.v), `Alert ${d.v === 'Paused' ? 'paused' : 'resumed'}.`)) loadData();
+  },
+  ruleDel: (d) => {
+    const r = S.alertsData.rules.find((x) => x.id === d.id);
+    ask({
+      title: `Delete alert "${r.name}"?`,
+      lines: ['Its trigger history, including reviews used for alert-quality measurement, is deleted too.'],
+      label: 'Delete alert',
+      run: async () => {
+        await api.deleteAlert(d.id);
+        toast('Alert deleted.');
+        await loadData();
+      },
+    });
+  },
+  openTrigger: async (d) => {
+    await guarded(() => api.openTrigger(d.id));
+    loadData();
+    toast('Marked as investigated.');
+  },
+  disTrigger: async (d) => {
+    if (await guarded(() => api.dismissTrigger(d.id), 'Alert dismissed.')) loadData();
+  },
+  fb: async (d) => {
+    if (await guarded(() => api.reviewTrigger(d.id, d.v), 'Thanks — recorded for alert-quality tracking.')) loadData();
+  },
+
+  applyBaseline: () => loadData(),
 };
 
-// Event listener
+// Event listeners
 document.addEventListener('click', (ev) => {
   const t = ev.target.closest('[data-a]');
   if (!t) return;
@@ -350,9 +1010,24 @@ document.addEventListener('click', (ev) => {
   if (f) f(t.dataset, ev);
 });
 
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape') return;
+  if (S.confirm) A.confirmNo();
+  else if (S.modal) A.closeModal();
+});
+
 let searchTimeout;
 document.addEventListener('input', (ev) => {
   const t = ev.target;
+  if (t.dataset.f !== undefined && S.modal) {
+    const k = t.dataset.f;
+    if (S.modal.form && k in S.modal.form) S.modal.form[k] = t.value;
+    if (S.modal.type === 'addGroup' && k === 'q') {
+      S.modal.q = t.value;
+      renderModals();
+    }
+    return;
+  }
   const k = t.dataset.set;
   if (!k) return;
   const val = t.value;
@@ -363,11 +1038,34 @@ document.addEventListener('input', (ev) => {
       T.page = 0;
       loadData();
     }, 350);
+  } else if (k === 'S.exportBaseline') {
+    S.exportBaseline = val;
   }
 });
 
-document.addEventListener('change', (ev) => {
+document.addEventListener('change', async (ev) => {
   const t = ev.target;
+  if (t.dataset.f !== undefined && S.modal) {
+    const k = t.dataset.f;
+    if (S.modal.type === 'alert') {
+      const f = S.modal.form;
+      f[k] = t.value;
+      S.modal.test = null;
+      if (k === 'metric') S.modal.metricTouched = true;
+      if (k === 'entityType') {
+        f.entityIds = [];
+        S.modal.metricTouched = false;
+        await refreshRecommendation();
+      }
+      renderModals();
+    } else if (S.modal.type === 'addGroup' && k === 'groupId') {
+      S.modal.groupId = t.value;
+      const g = S.groupsData.groups.find((x) => x.id === t.value);
+      S.modal.memberIds = g.members.map((m) => m.campaignId);
+      renderModals();
+    }
+    return;
+  }
   const k = t.dataset.set;
   if (!k) return;
   const val = t.value;
@@ -379,6 +1077,9 @@ document.addEventListener('change', (ev) => {
     T.size = +val;
     T.page = 0;
     loadData();
+  } else if (k === 'S.activityType') {
+    S.activityType = val;
+    loadData();
   } else if (k === 'S.cs' || k === 'S.ce' || k === 'S.ps' || k === 'S.pe') {
     S[k.slice(2)] = val;
     if (k === 'S.cs' || k === 'S.ce') {
@@ -388,9 +1089,12 @@ document.addEventListener('change', (ev) => {
         S.ps = addD(S.pe, -(L - 1));
       }
     }
+    api.track('period_changed', { source: 'custom' });
     loadData();
   }
 });
 
-// Initial boot
+// Initial boot: governance_opened starts the session (the "B" clock), then the alert engine runs.
+api.track('governance_opened', { source: 'overview' });
+api.evaluateAlerts().catch(() => {});
 loadData();

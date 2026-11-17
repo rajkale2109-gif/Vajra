@@ -24,6 +24,16 @@ const envSchema = z.object({
   DEFAULT_BUDGET_WARNING_THRESHOLD: z.coerce.number().default(0.85),
   ALERT_COOLDOWN_HOURS: z.coerce.number().default(24),
 
+  // Success-metric decision thresholds (proposed initial thresholds, not benchmarks)
+  FALSE_POSITIVE_RATE_LIMIT: z.coerce.number().default(40),
+  ALERT_ACTION_RATE_FLOOR: z.coerce.number().default(15),
+  WORKFLOW_ADOPTION_FLOOR: z.coerce.number().default(20),
+  EXPORT_REDUCTION_TARGET: z.coerce.number().default(30),
+  // Pre-launch baseline of morning CSV exports per week (unset until measured)
+  EXPORT_BASELINE_PER_WEEK: z.coerce.number().optional(),
+  // 'simulated' runs the clock from SIMULATED_CURRENT_DATE 09:00; 'real' uses wall-clock time
+  CLOCK_MODE: z.enum(['simulated', 'real']).default('simulated'),
+
   // Mailer
   MAILER_DRIVER: z.enum(['log', 'mailhog', 'smtp']).default('log'),
   SMTP_HOST: z.string().default('localhost'),

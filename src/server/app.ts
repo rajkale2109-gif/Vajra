@@ -6,6 +6,8 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { overviewRoutes } from './routes/overview.js';
 import { campaignsRoutes } from './routes/campaigns.js';
+import { workspaceRoutes, installErrorHandler } from './routes/workspace.js';
+import { eventsRoutes } from './routes/events.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -62,11 +64,15 @@ export async function buildApp(): Promise<FastifyInstance> {
     }
   }
 
+  installErrorHandler(app);
+
   // Register API routes
   await app.register(
     async (apiServer) => {
       await apiServer.register(overviewRoutes);
       await apiServer.register(campaignsRoutes);
+      await apiServer.register(workspaceRoutes);
+      await apiServer.register(eventsRoutes);
     },
     { prefix: '/api' }
   );

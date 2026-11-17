@@ -139,7 +139,12 @@ export const alertTriggers = pgTable('alert_triggers', {
   periodPreviousStart: text('period_previous_start').notNull(),
   periodPreviousEnd: text('period_previous_end').notNull(),
   excludedCount: integer('excluded_count').default(0).notNull(),
-  feedback: text('feedback'), // e.g. 'not_actionable'
+  feedback: text('feedback'), // 'misleading' | 'not_actionable' | 'valid' (false-positive review)
+  status: text('status').default('open').notNull(), // 'open' | 'opened' | 'dismissed' | 'recovered'
+  provisional: boolean('provisional').default(false).notNull(),
+  entityLabel: text('entity_label').default('').notNull(),
+  message: text('message').default('').notNull(),
+  triggeredAt: text('triggered_at').default('').notNull(), // simulated-clock ISO timestamp
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -185,6 +190,7 @@ export const analyticsEvents = pgTable('analytics_events', {
   issueId: text('issue_id'),
   objective: text('objective'),
   platform: text('platform'),
+  severity: text('severity'),
   dataState: text('data_state'),
   selectedCount: integer('selected_count'),
   payload: text('payload'),
