@@ -102,8 +102,8 @@ const S = {
   groupsData: null,
   alertsData: null,
   activityData: null,
-  metricsData: null,
-  exportBaseline: '',
+  settingsData: null,
+  settingsForm: null,
   openGroups: {},
   activityType: '',
   issAll: false,
@@ -173,7 +173,10 @@ async function loadData(opts = {}) {
       S.alertsData = await api.getAlerts();
     }
     if (S.pg === 'activity') S.activityData = await api.getActivity(S.activityType);
-    if (S.pg === 'metrics') S.metricsData = await api.getSuccessMetrics({ days: 7, export_baseline: S.exportBaseline });
+    if (S.pg === 'settings') {
+      S.settingsData = await api.getSettings();
+      S.settingsForm = { ...S.settingsData.preferences };
+    }
     await refreshGraphs();
   } catch (err) {
     toast(`Error loading data: ${err.message}`, 1);
@@ -486,25 +489,6 @@ function activityGraph(d) {
   );
 }
 
-// ---- Success metrics -----------------------------------------------------------------------
-function metricsGraph(m) {
-  const dr = m.drivers;
-  const g = m.guardrail;
-  const th = m.thresholds || {};
-  const ns = m.northStar;
-  const mw = m.manualWorkflow;
-  const reviewedOk = Math.max(0, g.reviewedTriggeredAlerts - g.misleadingAlerts);
-  const rows = [
-    { label: 'A · Detect → investigate', value: ns.detectToInvestigateMedianMinutes, valueText: dur(ns.detectToInvestigateMedianMinutes), color: 'var(--pri)' },
-    { label: 'B · Governance opened → issue opened', value: ns.activeSessionMedianMinutes, valueText: dur(ns.activeSessionMedianMinutes), color: PALETTE[1] },
-  ];
-  return gpanel(
-    'Success metrics at a glance',
-    'Bars show where each measure sits; the amber tick is the proposed threshold (not a benchmark).',
-    `<div class=gc><div>${gauge({ label: 'Weekly governance action rate', value: dr.weeklyGovernanceActionRate, text: pctv(dr.weeklyGovernanceActionRate) })}${gauge({ label: 'Group adoption', value: dr.groupAdoptionRate, text: pctv(dr.groupAdoptionRate) })}${gauge({ label: 'Alert action rate', value: dr.alertActionRate, text: pctv(dr.alertActionRate), threshold: th.alertActionRateFloor, thresholdText: th.alertActionRateFloor != null ? `Floor ${th.alertActionRateFloor}%` : '', goodWhen: 'high' })}${gauge({ label: 'Alert false-positive rate', value: g.alertFalsePositiveRate, text: pctv(g.alertFalsePositiveRate), threshold: th.falsePositiveRateLimit, thresholdText: th.falsePositiveRateLimit != null ? `Limit ${th.falsePositiveRateLimit}%` : '', goodWhen: 'low' })}${mw.reductionPct != null ? gauge({ label: 'Manual export reduction vs baseline', value: mw.reductionPct, text: pctv(mw.reductionPct), threshold: th.exportReductionTarget, thresholdText: th.exportReductionTarget != null ? `Target ${th.exportReductionTarget}%` : '', goodWhen: 'high' }) : ''}</div><div><div class=gl2>Time to investigate (median)</div>${hbars(rows, { empty: 'No investigated issues yet.' })}<div class=gl2 style="margin-top:14px">Reviewed alerts</div>${donut([{ label: 'Valid / actionable', value: reviewedOk, color: 'var(--ok)' }, { label: 'Misleading', value: g.misleadingAlerts, color: 'var(--bad)' }], { center: String(g.reviewedTriggeredAlerts), sub: 'reviewed' })}</div></div>`
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
@@ -656,32 +640,23 @@ function activity() {
 ${G.open.act ? `<div style="margin-top:14px">${activityGraph(d)}</div>` : ''}<div class=card style="margin-top:14px">${d.items.length ? `<div class=tw style="max-height:none"><table><thead><tr><th>When</th><th>Who</th><th>Type</th><th>Action</th><th>Related</th></tr></thead><tbody>${d.items.map((a) => `<tr><td class=sub>${e(a.timestampText)}</td><td>${e(a.userName)}</td><td><span class="bd info">${e(a.type)}</span></td><td>${e(a.actionText)}</td><td class=sub>${e(a.relatedEntity)}</td></tr>`).join('')}</tbody></table></div>` : '<div class=emp>No activity yet.</div>'}</div>`;
 }
 
-// ---- Success metrics ------------------------------------------------------
-const dur = (m) => (m == null ? '—' : m >= 120 ? `${(m / 60).toFixed(1)} h` : `${m.toFixed(1)} min`);
-const pctv = (v) => (v == null ? '—' : `${v}%`);
-const decisionBadge = (d) => `<span class="bd ${d.status === 'ok' ? 'ok' : d.status === 'investigate' ? 'bad' : 'n'}">${d.status === 'ok' ? 'On track' : d.status === 'investigate' ? 'Investigate' : 'Not enough data'}</span>`;
+// ---- Settings -------------------------------------------------------------
+const connBadge = (st) => `<span class="bd ${st === 'connected' ? 'ok' : st === 'delayed' ? 'warn' : 'bad'}">${st === 'connected' ? '● Connected' : st === 'delayed' ? '⏱ Delayed' : '✕ Failed'}</span>`;
 
-function metrics() {
-  const m = S.metricsData;
-  if (!m) return '<div class="card emp">Loading success metrics…</div>';
-  const ns = m.northStar;
-  const dr = m.drivers;
-  const g = m.guardrail;
-  const mw = m.manualWorkflow;
-  const dec = m.decision;
-  return `<div class=row><div><h1>Success metrics</h1><div class=sub>Measured from product events · last ${m.window.days} days · proposed thresholds, not benchmarks.</div></div><span class=sp></span>${graphBtn('met')}<button class=btn data-a=refresh>⟳ Refresh</button></div>
-${G.open.met ? `<div style="margin-top:14px">${metricsGraph(m)}</div>` : ''}<div class=card style="background:var(--navy);color:#fff;margin-top:14px"><div class=sub style="color:#8E9ABF">THE ONE NUMBER THAT MATTERS</div><div style="font-size:13px">${e(ns.name)}</div><div class=kv style="font-size:30px;margin:6px 0">${dur(ns.medianMinutes)}</div><div style="color:#C9D1E8">Median of detect-to-investigate (A) · ${ns.sampleSize} issue${ns.sampleSize === 1 ? '' : 's'} investigated</div>
-<div class=row style="margin-top:10px"><div><span class=sub style="color:#8E9ABF">A · Detect → investigate (incl. notification delay)</span><div><b>${dur(ns.detectToInvestigateMedianMinutes)}</b></div></div><div><span class=sub style="color:#8E9ABF">B · Governance opened → issue opened (${ns.activeSessionSampleSize})</span><div><b>${dur(ns.activeSessionMedianMinutes)}</b></div></div></div></div>
-<div class=kp style="grid-template-columns:repeat(4,1fr)">${kpi('Weekly action rate', pctv(dr.weeklyGovernanceActionRate), 'Planners with ≥1 meaningful action ÷ weekly active planners', `${dr.weeklyActivePlanners} weekly active planner(s)`)}${kpi('Group adoption', pctv(dr.groupAdoptionRate), 'Planners who create AND revisit a group ÷ weekly active planners', '')}${kpi('Alert action rate', pctv(dr.alertActionRate), 'Eligible triggered alerts that led to opening the affected campaign', `${dr.eligibleTriggeredAlerts} eligible alert(s)`)}${kpi('Alert false-positive rate', pctv(g.alertFalsePositiveRate), 'Primary guardrail: misleading ÷ reviewed triggered alerts. Dismissals are not false positives.', `${g.misleadingAlerts} of ${g.reviewedTriggeredAlerts} reviewed`)}</div>
-<div class=card><h2>Diagnostics</h2><div class=sub style="margin-top:6px">Alert dismissal rate: <b>${pctv(g.alertDismissalRate)}</b> (a dismissed alert is not automatically a false positive) · CSV exports this window: <b>${mw.exportClicks}</b> (${mw.exportsPerWeek}/week)</div></div>
-<div class=card><div class=row><h2>60-day decision</h2><span class=sp></span><span class=sub>Pre-launch export baseline (per week)</span><input type=number min=1 id=baseline data-set=S.exportBaseline value="${e(S.exportBaseline)}" style="width:90px" placeholder="unset"><button class=btn data-a=applyBaseline>Apply</button></div>
-<table style="margin-top:8px"><tbody>
-<tr><td><b>Alert quality</b></td><td>${decisionBadge(dec.alertQuality)}</td><td class=sub>${e(dec.alertQuality.detail)}</td></tr>
-<tr><td><b>Workflow adoption</b></td><td>${decisionBadge(dec.workflowAdoption)}</td><td class=sub>${e(dec.workflowAdoption.detail)}</td></tr>
-<tr><td><b>Manual workflow reduction</b></td><td>${decisionBadge(dec.manualWorkflowReduction)}</td><td class=sub>${e(dec.manualWorkflowReduction.detail)}</td></tr>
-</tbody></table>
-<div style="margin-top:8px"><b>Overall:</b> ${dec.overall === 'continue' ? 'Continue investing' : dec.overall === 'investigate' ? 'Investigate and iterate before further investment' : 'Not enough data yet to decide'}</div></div>
-<div class="sub" style="margin-top:8px">${e(m.methodology)}</div>`;
+function settings() {
+  const d = S.settingsData;
+  if (!d) return '<div class="card emp">Loading settings…</div>';
+  const p = S.settingsForm || d.preferences;
+  const dirty = JSON.stringify(p) !== JSON.stringify(d.preferences);
+  return `<h1>Settings</h1><div class=sub style="margin-bottom:14px">Profile, connections and preferences.</div>
+<div class=card><h2>Profile &amp; account</h2><p>${d.user ? `${e(d.user.name)} · ${e(d.user.role)} · ${e(d.user.email)}<br>` : ''}Account: ${e(d.account.name)} · Currency ${e(d.account.currency)} · Timezone ${e(d.account.timezone)}</p></div>
+<div class=card><h2>Connected platforms</h2>${d.connections.length ? `<table><tbody>${d.connections.map((c) => `<tr><td>${pl(c.platform)}</td><td>${connBadge(c.status)}</td><td>${c.lastSuccessfulSyncAt ? `Last sync ${e(c.lastSuccessfulSyncAt)}` : 'Never synced'}${c.message ? `<br><span class=sub>${e(c.message)}</span>` : ''}</td></tr>`).join('')}</tbody></table>` : '<div class=emp>No platforms connected.</div>'}</div>
+<div class=card><h2>Preferences</h2>
+<label style="display:flex;gap:8px;padding:4px"><input type=checkbox data-pref=dailySummaryEmail ${p.dailySummaryEmail ? 'checked' : ''}> Daily summary email</label>
+<label style="display:flex;gap:8px;padding:4px"><input type=checkbox data-pref=notifyImmediateHigh ${p.notifyImmediateHigh ? 'checked' : ''}> Notify immediately for High severity</label>
+<div class=fl style="max-width:320px;margin-top:8px"><label for=prp>Default reporting period</label><select id=prp data-pref=defaultReportingPeriod>${d.reportingPeriodOptions.map((o) => `<option ${p.defaultReportingPeriod === o ? 'selected' : ''}>${e(o)}</option>`).join('')}</select></div>
+<div class=fl style="max-width:320px"><label for=pmi>Minimum impressions per period</label><input type=number min=0 step=100 id=pmi data-pref=minImpressionsThreshold value="${e(p.minImpressionsThreshold)}"><span class=sub>Below this, comparisons and alerts are flagged as unreliable.</span></div>
+<div class=row><button class="btn p" data-a=saveSettings ${dirty ? '' : 'disabled'}>Save changes</button><button class=btn data-a=resetSettings ${dirty ? '' : 'disabled'}>Discard</button></div></div>`;
 }
 
 // ---- Modals ---------------------------------------------------------------
@@ -830,7 +805,6 @@ const NAV = [
   ['groups', 'Groups', '❖'],
   ['alerts', 'Alerts', '⚑'],
   ['activity', 'Activity Log', '⟲'],
-  ['metrics', 'Success metrics', '◎'],
   ['settings', 'Settings', '⚙'],
 ];
 const PAGE_NAME = Object.fromEntries(NAV.map((n) => [n[0], n[1]]));
@@ -843,8 +817,7 @@ function render() {
   else if (S.pg === 'groups') body = groups();
   else if (S.pg === 'alerts') body = alerts();
   else if (S.pg === 'activity') body = activity();
-  else if (S.pg === 'metrics') body = metrics();
-  else body = `<div class=card><h2>${e(PAGE_NAME[S.pg] || S.pg)}</h2><p>Account settings are not part of this release.</p></div>`;
+  else if (S.pg === 'settings') body = settings();
 
   // Preserve scroll and focus across full re-renders (state discipline)
   const sy = window.scrollY;
@@ -1341,7 +1314,17 @@ const A = {
     if (await guarded(() => api.reviewTrigger(d.id, d.v), 'Thanks — recorded for alert-quality tracking.')) loadData();
   },
 
-  applyBaseline: () => loadData(),
+  saveSettings: async () => {
+    if (!S.settingsForm) return;
+    const f = S.settingsForm;
+    const n = Number(f.minImpressionsThreshold);
+    if (!Number.isInteger(n) || n < 0) return toast('Minimum impressions must be a whole number, 0 or more.', 1);
+    if (await guarded(() => api.saveSettings({ ...f, minImpressionsThreshold: n }), 'Settings saved.')) loadData();
+  },
+  resetSettings: () => {
+    S.settingsForm = { ...S.settingsData.preferences };
+    render();
+  },
 };
 
 // Event listeners
@@ -1380,8 +1363,6 @@ document.addEventListener('input', (ev) => {
       T.page = 0;
       loadData();
     }, 350);
-  } else if (k === 'S.exportBaseline') {
-    S.exportBaseline = val;
   }
 });
 
@@ -1406,6 +1387,11 @@ document.addEventListener('change', async (ev) => {
       S.modal.memberIds = g.members.map((m) => m.campaignId);
       renderModals();
     }
+    return;
+  }
+  if (t.dataset.pref && S.settingsForm) {
+    S.settingsForm[t.dataset.pref] = t.type === 'checkbox' ? t.checked : t.value;
+    render();
     return;
   }
   const k = t.dataset.set;

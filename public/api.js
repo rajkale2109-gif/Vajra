@@ -70,7 +70,8 @@ export const api = {
   reviewIssue: (id) => apiRequest(`/issues/${id}/review`, json('POST', {})),
   dismissIssue: (id, source) => apiRequest(`/issues/${id}/dismiss`, json('POST', { sessionId, source })),
 
-  getSuccessMetrics: (params) => apiRequest(`/metrics/success${qs(params)}`),
+  getSettings: () => apiRequest('/settings'),
+  saveSettings: (body) => apiRequest('/settings', json('PUT', body)),
 
   /** Fire-and-forget product event; tracking must never break the UI. */
   track: (event, props = {}) => {
